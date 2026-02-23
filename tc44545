@@ -140,3 +140,17 @@ SELECT COUNT(*)
 FROM reclamos_master
 WHERE fecha_descarga = '2026-02-22'
 AND STRFTIME('%Y-%m', purchase_date) = '2025-11';
+
+kiki
+WITH estado_actual AS (
+    SELECT *,
+           ROW_NUMBER() OVER (
+               PARTITION BY transaction_id
+               ORDER BY fecha_descarga DESC
+           ) AS rn
+    FROM reclamos_master
+)
+SELECT transaction_id
+FROM estado_actual
+WHERE rn = 1
+AND STRFTIME('%Y-%m', purchase_date) = '2025-11';
