@@ -1,3 +1,16 @@
+434
+SELECT
+    STRFTIME('%Y', purchase_date) AS año,
+    STRFTIME('%m', purchase_date) AS mes,
+    ROUND(SUM(fraud_amount), 2) AS monto,
+    COUNT(transaction_id) AS reclamos
+FROM reclamos_master
+WHERE fecha_descarga = (
+    SELECT MAX(fecha_descarga) FROM reclamos_master
+)
+GROUP BY año, mes
+ORDER BY año, mes;
+
 # Fecha mínima del archivo nuevo
 min_fecha = df["fraud_post_date"].min()
 
