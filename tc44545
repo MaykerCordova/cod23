@@ -86,3 +86,26 @@ FROM estado_actual
 WHERE rn = 1
 GROUP BY year, month
 ORDER BY year, month;
+
+
+$$$$$$$$$$
+WITH estado_actual AS (
+    SELECT *,
+           ROW_NUMBER() OVER (
+               PARTITION BY transaction_id
+               ORDER BY fecha_descarga DESC
+           ) AS rn
+    FROM reclamos_master
+)
+SELECT COUNT(*)
+FROM estado_actual
+WHERE rn = 1
+  AND strftime('%Y-%m', purchase_date) = '2025-11'
+  AND transaction_id IS NULL;
+
+
+SELECT COUNT(*)
+FROM estado_actual
+WHERE rn = 1
+  AND strftime('%Y-%m', purchase_date) = '2025-11'
+  AND TRIM(transaction_id) = '';
