@@ -1,0 +1,59 @@
+import pandas as pd
+from pathlib import Path
+
+# ---------------------------------------------------
+# 1️⃣ Definir archivos
+# ---------------------------------------------------
+
+ruta = Path("ruta/a/tus/archivos")
+
+archivos = {
+    "2025-10": ruta / "octubre_2025.xlsx",
+    "2025-11": ruta / "noviembre_2025.xlsx",
+    "2025-12": ruta / "diciembre_2025.xlsx",
+    "2026-01": ruta / "enero_2026.xlsx",
+    "2026-02": ruta / "febrero_2026.xlsx"
+}
+
+# ---------------------------------------------------
+# 2️⃣ Leer y consolidar
+# ---------------------------------------------------
+
+df_total = (
+    pd.concat(
+        [
+            pd.read_excel(path)
+              .assign(mes_reporte=mes)
+            for mes, path in archivos.items()
+        ],
+        ignore_index=True
+    )
+)
+
+# ---------------------------------------------------
+# 3️⃣ Pivotear a formato reporte
+# ---------------------------------------------------
+
+reporte_final = (
+    df_total
+    .pivot(
+        index="Condicion",
+        columns="mes_reporte",
+        values=["Condiciones cumplidas", "Fraude", "Descartadas"]
+    )
+    .fillna(0)
+    .sort_index(axis=1)
+)
+
+# ---------------------------------------------------
+# 4️⃣ Aplanar columnas (más limpio para Excel)
+# ---------------------------------------------------
+
+reporte_final.columns = [
+    f"{metric}_{mes}"
+    for metric, mes in reporte_final.columns
+]
+
+reporte_final = reporte_final.reset_index()
+
+reporte_final.head()
