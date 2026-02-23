@@ -1,0 +1,49 @@
+# Fecha mínima del archivo nuevo
+min_fecha = df["fraud_post_date"].min()
+
+existentes = pd.read_sql(
+    """
+    SELECT transaction_id, fraud_amount, fraud_post_date
+    FROM reclamos_master
+    WHERE fraud_post_date >= ?
+    """,
+    conn,
+    params=[min_fecha]
+)
+
+
+
+
+---
+
+
+import os
+import sqlite3
+from datetime import date
+from pipeline_carga import cargar_excel_incremental
+
+DB_PATH = r"C:\Users\...\Fraude_TC40\database\fraude_reclamos.db"
+CARPETA_DESCARGAS = r"C:\Users\...\Fraude_TC40\data\descargas"
+
+fecha_corte = date.today().isoformat()
+
+conn = sqlite3.connect(DB_PATH)
+
+for archivo in os.listdir(CARPETA_DESCARGAS):
+
+    if archivo.endswith(".xlsx"):
+
+        ya_cargado = conn.execute(
+            "SELECT COUNT(*) FROM log_cargas WHERE archivo = ?",
+            (archivo,)
+        ).fetchone()[0]
+
+        if ya_cargado > 0:
+            print(f"{archivo} ya fue procesado. Se omite.")
+            continue
+
+        ruta = os.path.join(CARPETA_DESCARGAS, archivo)
+        print(f"Procesando: {archivo}")
+        cargar_excel_incremental(ruta, fecha_corte)
+
+conn.close()
