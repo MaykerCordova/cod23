@@ -47,3 +47,23 @@ for archivo in os.listdir(CARPETA_DESCARGAS):
         cargar_excel_incremental(ruta, fecha_corte)
 
 conn.close()
+
+
+------------
+WITH estado_actual AS (
+    SELECT *,
+           ROW_NUMBER() OVER (
+               PARTITION BY transaction_id
+               ORDER BY fecha_descarga DESC
+           ) AS rn
+    FROM reclamos_master
+)
+SELECT
+    strftime('%Y', purchase_date) AS year,
+    strftime('%m', purchase_date) AS month,
+    COUNT(*) AS reclamos,
+    ROUND(SUM(fraud_amount), 2) AS monto
+FROM estado_actual
+WHERE rn = 1
+GROUP BY year, month
+ORDER BY year, month;
