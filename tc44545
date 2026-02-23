@@ -128,3 +128,15 @@ FROM estado_actual
 WHERE rn = 1
 GROUP BY año, mes
 ORDER BY año, mes;
+
+
+kixd
+SELECT COUNT(*)
+FROM reclamos_master
+WHERE fecha_descarga = '2026-02-23'
+AND STRFTIME('%Y-%m', purchase_date) = '2025-11';
+
+SELECT COUNT(*)
+FROM reclamos_master
+WHERE fecha_descarga = '2026-02-22'
+AND STRFTIME('%Y-%m', purchase_date) = '2025-11';
