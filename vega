@@ -1,0 +1,61 @@
+{
+  "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+  "data": {"name": "dataset"},
+  "transform": [
+    {
+      "calculate": "datum['Cum Tx %']",
+      "as": "cum_tx"
+    },
+    {
+      "calculate": "datum['Cum Fraud Amount %']",
+      "as": "cum_fraud"
+    }
+  ],
+  "layer": [
+    {
+      "mark": {
+        "type": "line",
+        "point": true,
+        "strokeWidth": 3
+      },
+      "encoding": {
+        "x": {
+          "field": "cum_tx",
+          "type": "quantitative",
+          "title": "% acumulado de transacciones",
+          "axis": {"format": "%"},
+          "scale": {"domain": [0, 1]}
+        },
+        "y": {
+          "field": "cum_fraud",
+          "type": "quantitative",
+          "title": "% acumulado de monto fraudulento",
+          "axis": {"format": "%"},
+          "scale": {"domain": [0, 1]}
+        },
+        "tooltip": [
+          {"field": "Decil Rank Monto", "type": "ordinal"},
+          {"field": "cum_tx", "type": "quantitative", "format": ".2%"},
+          {"field": "cum_fraud", "type": "quantitative", "format": ".2%"}
+        ]
+      }
+    },
+    {
+      "mark": {
+        "type": "line",
+        "strokeDash": [5,5],
+        "color": "red"
+      },
+      "encoding": {
+        "x": {
+          "field": "cum_tx",
+          "type": "quantitative"
+        },
+        "y": {
+          "field": "cum_tx",
+          "type": "quantitative"
+        }
+      }
+    }
+  ]
+}
