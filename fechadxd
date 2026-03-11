@@ -1,0 +1,27 @@
+El error es claro: pandas no reconoce `"31 ene. 2026 23:57:13"` porque está en **español** (con el punto abreviado del mes). Necesitas traducir los meses manualmente antes de parsear.
+
+```python
+import pandas as pd
+
+# Diccionario de meses en español → número
+meses_es = {
+    "ene.": "01", "feb.": "02", "mar.": "03", "abr.": "04",
+    "may.": "05", "jun.": "06", "jul.": "07", "ago.": "08",
+    "sep.": "09", "oct.": "10", "nov.": "11", "dic.": "12"
+}
+
+def parsear_fecha_es(texto):
+    for mes_es, mes_num in meses_es.items():
+        if mes_es in str(texto):
+            texto = str(texto).replace(mes_es, mes_num)
+            break
+    # Ahora queda como "31 01 2026 23:57:13"
+    return pd.to_datetime(texto, format="%d %m %Y %H:%M:%S")
+
+df["fecha"] = df["Alert Timestamp (America/Lima)"].apply(parsear_fecha_es)
+
+# Solo la fecha dd/mm/yyyy
+df["fecha"] = df["fecha"].dt.strftime("%d/%m/%Y")
+```
+
+El problema era simplemente que `"ene."` no es un token que pandas reconozca — con este reemplazo previo ya funciona sin problema.
