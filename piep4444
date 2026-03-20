@@ -1,0 +1,584 @@
+"""
+pipeline_condiciones.py
+=======================
+Pipeline maestro de automatización de condiciones de fraude.
+
+FLUJO:
+  1. Descarga el Excel de condiciones desde Outlook (carpeta "condiciones automatizadas")
+  2. Lee y valida el archivo
+  3. Segmenta por condición automáticamente
+  4. Por cada condición: procesa, exporta TXT + Excel, actualiza correlativo
+  5. Actualiza el acumulado histórico de comercios
+
+EJECUCIÓN:
+  python pipeline_condiciones.py
+
+PRIMER USO:
+  - Configura las variables del bloque CONFIG más abajo.
+  - En cada carpeta de condición nueva, el correlativo inicia en ICORR_SEMILLA_DEFAULT.
+"""
+
+import os
+import re
+import math
+import json
+import stat
+import logging
+import warnings
+from datetime import datetime
+from pathlib import Path
+
+import pandas as pd
+import win32com.client  # pip install pywin32
+
+warnings.filterwarnings("ignore")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CONFIG — ajusta estos valores antes de ejecutar
+# ──────────────────────────────────────────────────────────────────────────────
+# ⚠️  NO se necesitan credenciales. Win32com usa el Outlook abierto en tu PC.
+OUTLOOK_FOLDER   = "condiciones automatizadas"      # nombre exacto de la carpeta/regla en Outlook
+
+BASE_DIR         = Path(__file__).resolve().parent  # carpeta donde vive este script
+INGESTA_DIR      = BASE_DIR / "_ingesta"            # Excel descargado cae aquí
+HISTORICO_PATH   = BASE_DIR / "_historico_comercios.xlsx"
+
+ICORR_SEMILLA_DEFAULT = 100000   # correlativo inicial para condiciones nuevas
+REGISTROS_POR_TXT     = 800      # máximo de registros por archivo TXT
+TOTAL_LEN_REGISTRO    = 875      # ancho fijo del registro posicional
+
+# Columnas requeridas en el Excel fuente
+COL_TARJETA    = "ACF-TARJETA REGISTRO 750"
+COL_BANCO      = "ACF-CODIGO BANCO DESTINO TRANSF. INMEDIATA"
+COL_FECHA      = "ACF-FECHA TRX"
+COL_HORA       = "ACF-HORA TRX"
+COL_CLIENTE    = "ACF-ID CLIENTE"
+COL_COMERCIO   = "ACF-NOMBRE/LOCALIZACION COMERCIO"
+COL_CONDICION  = "ACF-CONDICIONES QUE GENERARON ALERTA"
+
+SKIP_ROWS = 4   # filas de metadatos antes del header en el Excel fuente
+
+# ──────────────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 0) INGESTA — descarga desde Outlook via Win32com (sin credenciales)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def descargar_excel_outlook(folder_name: str, destino: Path) -> Path:
+    """
+    Se conecta al Outlook que ya está abierto en tu PC (win32com).
+    Busca la carpeta indicada dentro del Inbox, toma el correo más reciente
+    con adjunto .xlsx y lo guarda en destino/.
+
+    REQUISITO: Outlook debe estar abierto y con sesión activa.
+    INSTALACIÓN: pip install pywin32
+    """
+    log.info("Conectando a Outlook via Win32com...")
+
+    try:
+        outlook = win32com.client.Dispatch("Outlook.Application")
+        namespace = outlook.GetNamespace("MAPI")
+    except Exception as e:
+        raise RuntimeError(
+            "No se pudo conectar a Outlook. "
+            "Asegúrate de que Outlook esté abierto en tu PC.\n"
+            f"Error: {e}"
+        )
+
+    inbox = namespace.GetDefaultFolder(6)  # 6 = olFolderInbox
+
+    # Buscar la subcarpeta por nombre (la regla que ya creaste)
+    target_folder = None
+    for folder in inbox.Folders:
+        if folder.Name.lower() == folder_name.lower():
+            target_folder = folder
+            break
+
+    if target_folder is None:
+        raise FileNotFoundError(
+            f"No se encontró la carpeta '{folder_name}' dentro del Inbox de Outlook.\n"
+            f"Verifica que el nombre en CONFIG coincida exactamente con tu regla."
+        )
+
+    # Ordenar por fecha de recepción descendente y tomar el más reciente
+    items = target_folder.Items
+    items.Sort("[ReceivedTime]", True)  # True = descendente
+
+    destino.mkdir(parents=True, exist_ok=True)
+
+    for i in range(1, min(items.Count + 1, 6)):  # revisar los últimos 5 correos
+        mail = items[i]
+        if mail.Attachments.Count == 0:
+            continue
+        for j in range(1, mail.Attachments.Count + 1):
+            att = mail.Attachments.Item(j)
+            nombre = att.FileName
+            if nombre.lower().endswith((".xlsx", ".xls")):
+                ruta = destino / nombre
+                att.SaveAsFile(str(ruta))
+                log.info(f"Excel descargado: {nombre}  (asunto: {mail.Subject})")
+                return ruta
+
+    raise FileNotFoundError(
+        f"No se encontró ningún adjunto .xlsx en los últimos correos "
+        f"de la carpeta '{folder_name}'."
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1) UTILIDADES DE CARPETAS / FECHAS / CORRELATIVO
+# ══════════════════════════════════════════════════════════════════════════════
+
+def normalize_ddmmyyyy(x) -> str:
+    if x is None or str(x).strip() == "":
+        return datetime.today().strftime("%d%m%Y")
+    digits = re.sub(r"\D", "", str(x).strip())
+    if len(digits) != 8:
+        raise ValueError(f"Fecha debe ser 8 dígitos (DDMMYYYY). Ej: 20032026. Recibido: {x!r}")
+    return digits
+
+
+def _estado_path(export_root: Path) -> Path:
+    return Path(export_root) / "_estado_correlativo.json"
+
+
+def cargar_ultimo_correlativo(export_root: Path):
+    p = _estado_path(export_root)
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        v = data.get("ultimo_correlativo")
+        return int(v) if v is not None else None
+    except Exception:
+        return None
+
+
+def guardar_ultimo_correlativo(export_root: Path, ultimo: int,
+                               fecha_proceso: str, archivo_base: str):
+    payload = {
+        "ultimo_correlativo": int(ultimo),
+        "fecha_proceso": str(fecha_proceso),
+        "archivo_base": str(archivo_base),
+        "actualizado_en": datetime.now().isoformat(timespec="seconds"),
+    }
+    _estado_path(export_root).write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def obtener_icorr_siguiente(export_root: Path, icorr_semilla=None) -> int:
+    if icorr_semilla is not None:
+        return int(icorr_semilla)
+    ultimo = cargar_ultimo_correlativo(export_root)
+    if ultimo is None:
+        log.warning(
+            f"No existe estado de correlativo en {export_root}. "
+            f"Usando semilla por defecto: {ICORR_SEMILLA_DEFAULT}"
+        )
+        return ICORR_SEMILLA_DEFAULT
+    return ultimo + 1
+
+
+def safe_empty_dir(folder: Path, pattern: str = "*.txt"):
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    for f in folder.glob(pattern):
+        try:
+            f.unlink()
+        except PermissionError:
+            try:
+                os.chmod(f, stat.S_IWRITE)
+                f.unlink()
+            except Exception:
+                pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2) HELPERS DE PARSING / FORMAT
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _to_str(x) -> str:
+    if pd.isna(x):
+        return ""
+    if isinstance(x, (int, float)):
+        if isinstance(x, float) and x.is_integer():
+            x = int(x)
+        return str(x)
+    return str(x).strip()
+
+
+def _zfill_digits(x, width: int) -> str:
+    s = _to_str(x)
+    s = re.sub(r"\D", "", s)
+    return s.zfill(width)[:width]
+
+
+def _pad_left(x, width: int, fill: str = " ") -> str:
+    return _to_str(x).rjust(width, fill)[:width]
+
+
+def _pad_right(x, width: int, fill: str = " ") -> str:
+    return _to_str(x).ljust(width, fill)[:width]
+
+
+def _yyyymmdd_from_acf_fecha_trx(x) -> str:
+    s = _zfill_digits(x, 8)
+    return s if len(s) == 8 else ""
+
+
+def _hora_6(x) -> str:
+    s = _to_str(x)
+    if s == "":
+        return "000000"
+    digits = re.sub(r"\D", "", s)
+    if len(digits) >= 6:
+        return digits[-6:]
+    return digits.zfill(6)
+
+
+def _numero_tarjeta(j_tarjeta_750, banco_destino) -> str:
+    t = _to_str(j_tarjeta_750)
+    b = _to_str(banco_destino)
+    left6  = t[:6].ljust(6)
+    right4 = t[-4:].rjust(4) if len(t) >= 4 else t.rjust(4)
+    return f"{left6}{b}{right4}".strip()
+
+
+def _importe_correcto(x) -> str:
+    s = _to_str(x)
+    if s == "":
+        return "0" * 16
+    s = s.replace(".", "").replace(",", "")
+    s = re.sub(r"\D", "", s)
+    return s.zfill(16)[:16]
+
+
+def _moneda_correcta(x) -> str:
+    s = _to_str(x).upper()
+    if s == "PEN":
+        return "604"
+    if s == "USD":
+        return "840"
+    if s.isdigit() and len(s) == 3:
+        return s
+    return "000"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3) REGISTRO FIXED-WIDTH (875)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_registro_txt(df: pd.DataFrame, icorr: int,
+                       fechacarga: str, total_len: int = 875) -> pd.Series:
+    fc = _pad_right(fechacarga, 8, " ")
+    registros = []
+
+    for idx, row in df.iterrows():
+        correlativo = str(icorr + idx).zfill(6)
+
+        fecha8    = _pad_right(_to_str(row.get("Fecha Reclamo2",  "")), 8, " ")
+        fecha_txn8 = _pad_right(_to_str(row.get("Fecha Transacción", "")), 8, " ")
+        hora6     = _zfill_digits(_to_str(row.get("HORA", "000000")), 6)
+        bt15      = _pad_left(row.get("BT Correcta", row.get("BT", "")), 15, " ")
+        tar       = _pad_left(row.get("NUMERO DE TARJETA", ""), 128, " ")
+        importe16 = "0" * 16
+        moneda3   = "000"
+        autoriz6  = " " * 6
+
+        parts = [
+            correlativo,           #  1)   6
+            " " * 10,              #  2)  10
+            " " * 12,              #  3)  12
+            " " * 5,               #  4)   5
+            fecha8,                #  5)   8
+            "0" * 6,               #  6)   6
+            " " * 200,             #  7) 200
+            " " * 3,               #  8)   3
+            " " * 2,               #  9)   2
+            " 821",                # 10)   5
+            " 8750",               # 11)   5
+            bt15,                  # 12)  15
+            tar,                   # 13) 128
+            fecha_txn8,            # 14)   8
+            hora6,                 # 15)   6
+            importe16,             # 16)  16
+            moneda3,               # 17)   3
+            autoriz6,              # 18)   6
+            "000",                 # 19)   3
+            "S",                   # 20)   1
+            "000",                 # 21)   3
+            " " * 200,             # 22) 200
+            " " * 12,              # 23)  12
+            "SBP",                 # 24)   3
+            fc,                    # 25)   8
+            " " * 6,               # 26)   6
+            " " * 1,               # 27)   1
+            " " * 15,              # 28)  15
+            (" " * 19) + "N",      # 29)  20
+            " " * 20,              # 30)  20
+            " " * 20,              # 31)  20
+            " " * 20,              # 32)  20
+            " " * 20,              # 33)  20
+            " " * 20,              # 34)  20
+            " " * 20,              # 35)  20
+            " " * 20,              # 36)  20
+            " " * 19,              # 37)  19  ← ajuste total = 875
+        ]
+
+        registro = "".join(parts)
+        if len(registro) < total_len:
+            registro = registro.ljust(total_len, " ")
+        elif len(registro) > total_len:
+            registro = registro[:total_len]
+
+        registros.append(registro)
+
+    return pd.Series(registros, name="REGISTRO_TXT")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4) PIPELINE POR CONDICIÓN
+# ══════════════════════════════════════════════════════════════════════════════
+
+def procesar_condicion(df_cond: pd.DataFrame, condicion: str,
+                       base_dir: Path, fecha_proceso: str,
+                       nombre_archivo_fuente: str):
+    """
+    Procesa el subset de una condición específica.
+    Crea la carpeta si no existe, exporta TXT + Excel, actualiza correlativo.
+    """
+    # Normalizar código de condición (quitar ceros a la izquierda para nombre carpeta)
+    cod = condicion.lstrip("0") or condicion  # "0424" → "424"
+    cond_dir  = base_dir / cod
+    export_dir = cond_dir / "Exportado"
+    export_dir.mkdir(parents=True, exist_ok=True)
+
+    # Correlativo
+    icorr = obtener_icorr_siguiente(export_dir)
+
+    fechacarga    = fecha_proceso
+    fecha_proceso_norm = normalize_ddmmyyyy(fecha_proceso)
+
+    # Columnas calculadas
+    df = df_cond.copy().reset_index(drop=True)
+    df["NUMERO DE TARJETA"] = df.apply(
+        lambda r: _numero_tarjeta(r[COL_TARJETA], r[COL_BANCO]), axis=1
+    )
+    df["FECHA"] = df[COL_FECHA].apply(_yyyymmdd_from_acf_fecha_trx)
+    df["HORA"]  = df[COL_HORA].apply(_hora_6)
+
+    # Hoja1
+    hoja1 = pd.DataFrame({
+        "FECHA RECLAMO":      df["FECHA"],
+        "FECHA PROCESO":      df["FECHA"],
+        "FECHA TRANSACCION":  df["FECHA"],
+        "NUMERO DE TARJETA":  df["NUMERO DE TARJETA"],
+        "BT":                 df[COL_CLIENTE].apply(_to_str),
+        "COMERCIO":           df[COL_COMERCIO].apply(_to_str),
+        "CONDICION":          df[COL_CONDICION].apply(_to_str),
+        "CODIGO AUTORIZACION": "",
+        "IMPORTE":            "",
+        "MONEDA":             "",
+    })
+
+    hoja1["Fecha Reclamo2"]    = hoja1["FECHA RECLAMO"].apply(
+        lambda x: _pad_right(_to_str(x), 8, " "))
+    hoja1["Fecha Transacción"] = hoja1["FECHA TRANSACCION"].apply(
+        lambda x: _pad_right(_to_str(x), 8, " "))
+    hoja1["Tarjeta"]           = hoja1["NUMERO DE TARJETA"].apply(_to_str)
+    hoja1["Autorización"]      = hoja1["CODIGO AUTORIZACION"].apply(_to_str)
+    hoja1["Llave"]             = (hoja1["Fecha Reclamo2"]
+                                  + hoja1["Fecha Transacción"]
+                                  + hoja1["Autorización"])
+    hoja1["BT Correcta"]       = hoja1["BT"].apply(lambda x: _pad_left(x, 15, " "))
+    hoja1["Importe Correcto"]  = hoja1["IMPORTE"].apply(_importe_correcto)
+    hoja1["Moneda Correcta"]   = hoja1["MONEDA"].apply(_moneda_correcta)
+    hoja1["HORA"]              = df["HORA"]
+
+    fechacarga_norm = normalize_ddmmyyyy(fechacarga)
+    hoja1["REGISTRO_TXT"] = build_registro_txt(
+        hoja1, icorr=icorr, fechacarga=fechacarga_norm
+    )
+
+    # Carpeta de salida del día
+    run_dir = export_dir / fecha_proceso_norm
+    run_dir.mkdir(parents=True, exist_ok=True)
+    safe_empty_dir(run_dir, pattern="*.txt")
+
+    # Exportar TXT en paquetes de 800
+    rows_cnt  = len(hoja1)
+    files_cnt = math.ceil(rows_cnt / REGISTROS_POR_TXT) if rows_cnt > 0 else 1
+
+    for j in range(1, files_cnt + 1):
+        file_number = str(j).zfill(2)
+        file_path   = run_dir / f"RECLAMOS {fecha_proceso_norm}_{file_number}.txt"
+        start = (j - 1) * REGISTROS_POR_TXT
+        end   = min(j * REGISTROS_POR_TXT, rows_cnt)
+        lines = hoja1.loc[start:end - 1, "REGISTRO_TXT"].tolist()
+
+        with open(file_path, "w", encoding="utf-8", newline="") as f:
+            for k, line in enumerate(lines):
+                f.write(line + "\n" if k < len(lines) - 1 else line)
+
+    # Exportar Excel
+    xlsx_path = run_dir / f"salida_reclamos_{fecha_proceso_norm}.xlsx"
+    with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
+        hoja1.to_excel(writer, index=False, sheet_name="Hoja1")
+        hoja1[["REGISTRO_TXT"]].to_excel(writer, index=False, sheet_name="Hoja2")
+
+    # Actualizar correlativo
+    ultimo = icorr + len(hoja1) - 1 if len(hoja1) > 0 else icorr - 1
+    guardar_ultimo_correlativo(export_dir, ultimo, fecha_proceso_norm,
+                               nombre_archivo_fuente)
+
+    log.info(
+        f"  ✅ Condición {cod:>4} | {rows_cnt:>4} registros | "
+        f"ICORR {icorr}→{ultimo} | Salida: {run_dir.name}/"
+    )
+    return hoja1
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5) ACUMULADO HISTÓRICO DE COMERCIOS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def actualizar_historico_comercios(df_todos: pd.DataFrame, fecha_proceso: str,
+                                   historico_path: Path):
+    """
+    Agrega al acumulado histórico los comercios del día, por condición.
+    Columnas: FECHA_PROCESO, CONDICION, COMERCIO, FRECUENCIA_DIA, PRIMERA_VEZ
+    """
+    fecha_norm = normalize_ddmmyyyy(fecha_proceso)
+
+    resumen = (
+        df_todos.groupby(
+            [COL_CONDICION, COL_COMERCIO], as_index=False
+        )
+        .size()
+        .rename(columns={"size": "FRECUENCIA_DIA"})
+    )
+    resumen["FECHA_PROCESO"] = fecha_norm
+    resumen = resumen.rename(columns={
+        COL_CONDICION: "CONDICION",
+        COL_COMERCIO:  "COMERCIO",
+    })[["FECHA_PROCESO", "CONDICION", "COMERCIO", "FRECUENCIA_DIA"]]
+
+    if historico_path.exists():
+        hist = pd.read_excel(historico_path, dtype=str)
+        combinado = pd.concat([hist, resumen.astype(str)], ignore_index=True)
+    else:
+        combinado = resumen.astype(str)
+
+    # Marcar PRIMERA_VEZ por comercio+condición
+    combinado["PRIMERA_VEZ"] = ~combinado.duplicated(
+        subset=["CONDICION", "COMERCIO"], keep="first"
+    )
+
+    with pd.ExcelWriter(historico_path, engine="openpyxl") as writer:
+        combinado.to_excel(writer, index=False, sheet_name="Historico")
+
+    log.info(
+        f"  📊 Histórico actualizado: {len(resumen)} filas nuevas → "
+        f"{len(combinado)} total | {historico_path.name}"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 6) LECTURA DEL EXCEL FUENTE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def leer_excel_condiciones(path: Path) -> pd.DataFrame:
+    """
+    Lee el Excel de condiciones automatizadas.
+    Salta las 4 filas de metadatos. Normaliza nombres de columna a mayúsculas.
+    """
+    df = pd.read_excel(
+        path,
+        engine="openpyxl",
+        skiprows=SKIP_ROWS,
+        dtype={
+            "ACF-ID CLIENTE": "string",
+            "ACF-CODIGO BANCO DESTINO TRANSF. INMEDIATA": "string",
+        },
+    )
+    df.columns = [str(c).strip().upper() for c in df.columns]
+
+    # Verificar columnas mínimas
+    requeridas = {
+        COL_TARJETA, COL_BANCO, COL_FECHA,
+        COL_HORA, COL_CLIENTE, COL_COMERCIO, COL_CONDICION,
+    }
+    faltantes = requeridas - set(df.columns)
+    if faltantes:
+        raise ValueError(f"Faltan columnas en el Excel fuente: {faltantes}")
+
+    # Limpiar condición: forzar string y quitar espacios
+    df[COL_CONDICION] = df[COL_CONDICION].apply(
+        lambda x: str(int(float(x))).zfill(4) if pd.notna(x) else ""
+    )
+    df = df[df[COL_CONDICION] != ""]
+    log.info(f"Excel leído: {len(df)} registros | "
+             f"Condiciones: {sorted(df[COL_CONDICION].unique())}")
+    return df
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    log.info("=" * 60)
+    log.info("PIPELINE CONDICIONES AUTOMATIZADAS")
+    log.info("=" * 60)
+
+    # ── PASO 1: Descargar Excel desde Outlook ──
+    excel_path = descargar_excel_outlook(
+        folder_name=OUTLOOK_FOLDER,
+        destino=INGESTA_DIR,
+    )
+
+    # ── PASO 2: Leer y validar ──
+    df = leer_excel_condiciones(excel_path)
+
+    # Fecha de proceso = fecha en que se corre el pipeline (hoy)
+    # Es la fecha de carga, no la fecha de las transacciones
+    fecha_proceso = normalize_ddmmyyyy("")  # → DDMMYYYY de hoy
+    log.info(f"Fecha de proceso (hoy): {fecha_proceso}")
+
+    # ── PASO 3: Segmentar y procesar por condición ──
+    condiciones = sorted(df[COL_CONDICION].unique())
+    log.info(f"Condiciones a procesar: {condiciones}")
+
+    for condicion in condiciones:
+        df_cond = df[df[COL_CONDICION] == condicion]
+        log.info(f"Procesando condición {condicion} ({len(df_cond)} registros)...")
+        try:
+            procesar_condicion(
+                df_cond=df_cond,
+                condicion=condicion,
+                base_dir=BASE_DIR,
+                fecha_proceso=fecha_proceso,
+                nombre_archivo_fuente=excel_path.name,
+            )
+        except Exception as e:
+            log.error(f"  ❌ Error en condición {condicion}: {e}")
+
+    # ── PASO 4: Actualizar histórico de comercios ──
+    log.info("Actualizando histórico de comercios...")
+    actualizar_historico_comercios(df, fecha_proceso, HISTORICO_PATH)
+
+    log.info("=" * 60)
+    log.info("✅ Pipeline finalizado correctamente")
+    log.info("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
