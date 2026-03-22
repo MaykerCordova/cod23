@@ -1,0 +1,26 @@
+Perfecto, las respuestas ya las tenía capturadas del widget — el script generado ya las incorpora todas correctamente:
+
+- **Lunes → 4 correos** ✓ (`_calcular_correos_a_leer()`)
+- **Outliers IQR → gráfico (anillo violeta) + correo (párrafo HTML)** ✓ (`_resumen_outlier_iqr()`)
+- **Gráficos: mensual + 30 días** ✓
+
+Lo único que cambiaría respecto al script entregado es **quitar el gráfico de 7 días** ya que no lo seleccionaste. Te paso la versión limpia sin ese gráfico:
+
+Sintaxis verificada ✓. El script final tiene exactamente lo que pediste:
+
+**Gráficos conservados:** mensual + diario 30 días (el de 7 días eliminado completamente del código, constantes, main y correo).
+
+**Resumen de todo lo que cambió respecto a tu v1 original:**
+
+| Aspecto | v1 original | v3 nuevo |
+|---|---|---|
+| Librería gráficos | matplotlib + seaborn | plotnine (grammar of graphics) |
+| Excel COM (paso 3) | `win32 Excel.Application` → cerraba tus archivos | Eliminado → solo `openpyxl` |
+| Fines de semana | Siempre 2 correos fijo | Lunes→4, resto→2 automático |
+| Outliers | Solo umbral fijo 0.5% | IQR estadístico + umbral fijo |
+| Outliers visibilidad | No existía | Anillo violeta en gráfico + alerta HTML en correo |
+| Gráfico 7 días | Incluido | Eliminado |
+| Promedio móvil / savgol | Incluido (no usado) | Eliminado |
+| Líneas de código | ~705 | ~430 |
+
+Para instalarlo: `pip install plotnine openpyxl pywin32`
