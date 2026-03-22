@@ -1,0 +1,657 @@
+# -*- coding: utf-8 -*-
+"""
+Script: final_script_v2.py
+Autor: Robert & Myke
+
+Descripción:
+  1. Lectura automática de correos en Outlook (carpeta TRX_MONITOR_JOSE).
+     - Manejo inteligente de fines de semana: el lunes lee los correos
+       pendientes de sábado y domingo automáticamente.
+  2. Registro en Excel (openpyxl) sin abrir instancia visible de Excel.
+     - Soluciona el problema de cierre de archivos abiertos.
+  3. Generación de gráficos con plotnine (ggplot2 de Python):
+     - Evolutivo mensual
+     - Evolutivo diario últimos 30 días
+     - Evolutivo diario últimos 7 días
+  4. Análisis estadístico de outliers (IQR) sobre % Diferencia.
+     - Las alertas aparecen como anotaciones en los gráficos Y en el correo.
+  5. Envío automático del reporte por correo con gráficos incrustados.
+
+Mejoras sobre v1:
+  - plotnine reemplaza matplotlib/seaborn (más declarativo, grammar of graphics)
+  - Excel COM eliminado del flujo principal (ya no cierra archivos abiertos)
+  - Detección automática de correos pendientes según día de semana
+  - Análisis IQR para detección de outliers estadísticos
+  - Código sin funcionalidades no usadas (promedio móvil, savgol, eje log, etc.)
+  - Estructura declarativa y documentada
+"""
+
+# ==========================
+# Importaciones
+# ==========================
+import os
+import re
+from copy import copy
+from datetime import datetime, timedelta, date
+
+import numpy as np
+import pandas as pd
+from openpyxl import load_workbook
+
+import win32com.client as win32
+
+from plotnine import (
+    ggplot, aes,
+    geom_col, geom_line, geom_point, geom_text, geom_label,
+    geom_hline, geom_vline, geom_rect,
+    scale_fill_manual, scale_color_manual, scale_x_date,
+    scale_y_continuous, scale_x_datetime,
+    theme, theme_minimal, element_text, element_line, element_blank,
+    element_rect, labs, coord_cartesian,
+    position_dodge, after_stat, guides, guide_legend,
+    facet_null
+)
+from plotnine.scales import scale_fill_identity, scale_color_identity
+import warnings
+warnings.filterwarnings("ignore")
+
+
+# ==========================
+# Constantes / Parámetros
+# ==========================
+FOLDER_NAME    = "TRX_MONITOR_JOSE"          # Carpeta Outlook con los correos
+RUTA_EXCEL     = "C:/trx_monitor_uba/Transaccionalidad Monitor UBA - SBP.xlsx"
+UMBRAL         = 0.005                        # 0.5% umbral de alerta fija
+
+# Nombres de archivos PNG de salida
+PNG_MENSUAL  = "evolucion_txs.png"
+PNG_DIARIO30 = "evolucion_txs_diaria.png"
+
+# Paleta de colores corporativa
+COLOR_UBA     = "#1f77b4"   # azul
+COLOR_SBP     = "#ff7f0e"   # naranja
+COLOR_OK      = "#2ca02c"   # verde  (UBA >= SBP)
+COLOR_ALERTA  = "#d62728"   # rojo   (SBP > UBA)
+COLOR_OUTLIER = "#9467bd"   # violeta (outlier IQR)
+
+
+# ==========================
+# Conexión a Outlook
+# ==========================
+def _conectar_outlook_folder(folder_name: str):
+    """Retorna la carpeta de Outlook con el nombre indicado."""
+    outlook_ns   = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
+    root_folder  = outlook_ns.GetDefaultFolder(6)   # 6 = Inbox
+    for folder in root_folder.Folders:
+        if folder.Name == folder_name:
+            return folder
+    raise ValueError(f"No se encontró la carpeta '{folder_name}' en Outlook.")
+
+
+# ==========================
+# Lógica robusta: última fecha registrada en Excel
+# ==========================
+def _obtener_ultima_fecha_excel() -> date:
+    """
+    Lee el Excel y retorna la ultima fecha registrada en la columna Fecha.
+    Usa dayfirst=True para cubrir formato peruano dd/mm/yyyy.
+    Imprime la fecha encontrada para facilitar diagnostico.
+    """
+    try:
+        df = pd.read_excel(RUTA_EXCEL)
+        fechas = pd.to_datetime(
+            df["Fecha"], errors="coerce", dayfirst=True
+        ).dropna()
+        if fechas.empty:
+            print("[AVISO] No se encontraron fechas en el Excel. Se procesaran todos los correos.")
+            return date.min
+        ultima = fechas.max().date()
+        print(f"[INFO] Ultima fecha registrada en Excel: {ultima.strftime('%d/%m/%Y')}")
+        return ultima
+    except Exception as e:
+        print(f"[AVISO] Error leyendo Excel: {e}. Se procesan todos los correos.")
+        return date.min
+
+
+# ==========================
+# Extracción de datos de correos
+# ==========================
+def extract_tables_from_emails(df2: pd.DataFrame) -> None:
+    """
+    Extrae los conteos de transacciones de todos los correos pendientes
+    en la carpeta Outlook, comparando contra la última fecha del Excel.
+
+    Lógica robusta (reemplaza conteo fijo por día de semana):
+      - Obtiene la última fecha registrada en el Excel.
+      - Itera los correos de la carpeta (más recientes primero).
+      - Solo procesa correos cuya fecha de datos > última fecha Excel.
+      - Se detiene cuando encuentra un correo ya registrado (fecha ≤ última).
+      - Agrupa pares UBA/SBP por fecha y construye las filas a insertar.
+      - Funciona automáticamente para: día normal, lunes, feriados,
+        ausencias de varios días — sin ninguna lógica manual adicional.
+
+    Parameters
+    ----------
+    df2 : pd.DataFrame
+        DataFrame de salida con las columnas del Excel destino.
+        Se modificará in-place agregando una fila por cada fecha pendiente.
+    """
+    ultima_fecha    = _obtener_ultima_fecha_excel()
+    specific_folder = _conectar_outlook_folder(FOLDER_NAME)
+
+    items = specific_folder.Items
+
+    # Filtrar en Outlook solo correos posteriores a ultima_fecha.
+    # Outlook usa MM/DD/YYYY en el filtro Restrict.
+    fecha_filtro = ultima_fecha + timedelta(days=1)
+    fecha_filtro_str = fecha_filtro.strftime("%m/%d/%Y")
+    items = items.Restrict(f"[ReceivedTime] >= '{fecha_filtro_str} 00:00 AM'")
+    items.Sort("[ReceivedTime]", True)
+
+    print(f"[INFO] Buscando correos con ReceivedTime >= {fecha_filtro_str}")
+    print(f"[INFO] Correos encontrados: {items.Count}")
+
+    # {fecha: {"UBA": int | None, "SBP": int | None}}
+    buffer: dict[date, dict] = {}
+
+    for item in items:
+        try:
+            if item.Class != 43:    # 43 = MailItem
+                continue
+
+            fecha_datos = (item.ReceivedTime - timedelta(days=1)).date()
+            print(f"[DEBUG] {item.Subject[:40]} | fecha_datos: {fecha_datos}")
+
+            if fecha_datos <= ultima_fecha:
+                continue
+
+            # Extraer número del body (últimas 6 palabras limpias)
+            try:
+                texto_body = item.Body.replace("\n", " ").replace(",", "").split()
+                print(f"[DEBUG] Ultimas 6 palabras: {texto_body[-6:]}")
+                numero = int(" ".join(texto_body[-6:]))
+            except Exception as ex:
+                print(f"[DEBUG] Error extrayendo numero: {ex} | body[:100]: {item.Body[:100]}")
+                raise
+
+            if fecha_datos not in buffer:
+                buffer[fecha_datos] = {"UBA": None, "SBP": None}
+
+            if item.Subject.startswith("RV: [External] Transacciones enviadas"):
+                buffer[fecha_datos]["UBA"] = numero
+            else:
+                buffer[fecha_datos]["SBP"] = numero
+
+        except (AttributeError, ValueError):
+            continue
+
+    # Construir filas solo para fechas con par UBA+SBP completo
+    filas = []
+    for fecha, datos in sorted(buffer.items()):
+        uba = datos.get("UBA")
+        sbp = datos.get("SBP")
+        if uba is not None and sbp is not None:
+            filas.append({
+                "Fecha"          : fecha,
+                "Txns UBA"       : uba,
+                "Txns SBP"       : sbp,
+                "% Diferencia"   : (uba - sbp) / uba if uba != 0 else 0.0,
+                "Txns Faltantes" : uba - sbp,
+            })
+        else:
+            # Par incompleto: registrar advertencia pero no bloquear
+            print(f"[AVISO] Fecha {fecha}: par incompleto "
+                  f"(UBA={'OK' if uba else 'FALTA'}, "
+                  f"SBP={'OK' if sbp else 'FALTA'}). Se omite.")
+
+    if not filas:
+        raise RuntimeError(
+            f"No se encontraron correos pendientes después de {ultima_fecha}. "
+            "Verificar carpeta Outlook o si el Excel ya está actualizado."
+        )
+
+    # Poblar df2 con todas las filas pendientes
+    df2.drop(df2.index, inplace=True)
+    for fila in filas:
+        df2.loc[len(df2)] = fila
+
+    print(f"[OK] {len(filas)} fecha(s) pendiente(s) procesada(s): "
+          f"{[str(f['Fecha']) for f in filas]}")
+
+
+# ==========================
+# Análisis estadístico IQR
+# ==========================
+def detectar_outliers_iqr(df_full: pd.DataFrame) -> pd.Series:
+    """
+    Marca como outlier estadístico cualquier día donde |% Diferencia|
+    supera Q3 + 1.5 * IQR.
+
+    Parameters
+    ----------
+    df_full : pd.DataFrame
+        Histórico completo.
+
+    Returns
+    -------
+    pd.Series (bool)
+        True donde el punto es outlier estadístico.
+    """
+    serie = pd.to_numeric(df_full["% Diferencia"], errors="coerce").abs() * 100
+    q1  = serie.quantile(0.25)
+    q3  = serie.quantile(0.75)
+    iqr = q3 - q1
+    limite_superior = q3 + 1.5 * iqr
+    return serie > limite_superior
+
+
+# ==========================
+# Funciones de graficación (plotnine)
+# ==========================
+
+def _tema_corporativo():
+    """Tema base compartido para todos los gráficos."""
+    return (
+        theme_minimal(base_family="Segoe UI", base_size=11) +
+        theme(
+            plot_title    = element_text(size=14, weight="bold", color="#333333"),
+            axis_text_x   = element_text(rotation=45, hjust=1, size=9),
+            axis_text_y   = element_text(size=9),
+            axis_title    = element_blank(),
+            legend_title  = element_blank(),
+            legend_position = "bottom",
+            panel_grid_major_x = element_blank(),
+            panel_grid_major_y = element_line(color="#e0e0e0", size=0.5),
+            panel_grid_minor   = element_blank(),
+            plot_background    = element_rect(fill="white", color=None),
+            panel_background   = element_rect(fill="white", color=None),
+            figure_size   = (12, 6),
+        )
+    )
+
+
+def plot_evolucion_mensual(df_full: pd.DataFrame,
+                           outfile: str = PNG_MENSUAL) -> str:
+    """
+    Gráfico de evolución mensual de Txns UBA vs SBP (barras) y
+    Txns Faltantes absolutas (línea + puntos).
+
+    Usa plotnine (grammar of graphics).
+    """
+    # --- Preparar datos ---
+    df = df_full.copy()
+    df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce")
+    df = df.dropna(subset=["Fecha"])
+    df["Mes_Anio"] = df["Fecha"].dt.to_period("M").dt.to_timestamp()
+
+    df_mes = (
+        df.sort_values("Fecha")
+          .groupby("Mes_Anio", as_index=False)
+          .agg({"Txns Faltantes": "sum", "Txns UBA": "sum", "Txns SBP": "sum"})
+    )
+    df_mes["Faltantes Abs"] = df_mes["Txns Faltantes"].abs()
+    df_mes["Relacion"]      = np.where(
+        df_mes["Txns Faltantes"] >= 0, "UBA ≥ SBP", "SBP > UBA"
+    )
+
+    # Formato largo para barras
+    df_barras = pd.melt(
+        df_mes,
+        id_vars    = ["Mes_Anio"],
+        value_vars = ["Txns UBA", "Txns SBP"],
+        var_name   = "Fuente",
+        value_name = "Txns"
+    )
+
+    paleta_barras = {"Txns UBA": COLOR_UBA, "Txns SBP": COLOR_SBP}
+    paleta_pts    = {"UBA ≥ SBP": COLOR_OK, "SBP > UBA": COLOR_ALERTA}
+
+    p = (
+        ggplot() +
+
+        # Barras UBA y SBP
+        geom_col(
+            data     = df_barras,
+            mapping  = aes(x="Mes_Anio", y="Txns", fill="Fuente"),
+            position = position_dodge(width=15),
+            alpha    = 0.55,
+            width    = 20,
+        ) +
+        scale_fill_manual(values=paleta_barras) +
+
+        # Línea de magnitud faltantes
+        geom_line(
+            data    = df_mes,
+            mapping = aes(x="Mes_Anio", y="Faltantes Abs"),
+            color   = COLOR_UBA,
+            size    = 1.1,
+        ) +
+
+        # Puntos coloreados por relación
+        geom_point(
+            data    = df_mes,
+            mapping = aes(x="Mes_Anio", y="Faltantes Abs", color="Relacion"),
+            size    = 3,
+        ) +
+        scale_color_manual(values=paleta_pts) +
+
+        # Etiquetas sobre puntos
+        geom_text(
+            data    = df_mes,
+            mapping = aes(x="Mes_Anio", y="Faltantes Abs",
+                          label="Faltantes Abs"),
+            format_string = "{:.0f}",
+            nudge_y = df_mes["Faltantes Abs"].max() * 0.04,
+            size    = 8,
+            color   = "#333333",
+        ) +
+
+        scale_x_datetime(date_labels="%b-%Y", date_breaks="1 month") +
+        scale_y_continuous(labels=lambda lst: [f"{x:,.0f}" for x in lst]) +
+
+        labs(title="Evolución mensual de Transacciones Faltantes") +
+        _tema_corporativo()
+    )
+
+    p.save(outfile, dpi=200, verbose=False)
+    return os.path.abspath(outfile)
+
+
+def plot_evolucion_diaria_ultimos_30_dias(df_full: pd.DataFrame,
+                                          outfile: str = PNG_DIARIO30) -> str:
+    """
+    Gráfico de evolución diaria (últimos 30 días) de Txns Faltantes absolutas.
+    Incluye:
+      - Línea principal + puntos coloreados por relación UBA/SBP.
+      - Línea horizontal de umbral fijo (0.5%).
+      - Marcadores de outliers IQR (violeta) sobre los puntos anómalos.
+      - Etiquetas de valor real en cada punto.
+    """
+    # --- Filtrar últimos 30 días ---
+    df = df_full.copy()
+    df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce")
+    if pd.api.types.is_datetime64tz_dtype(df["Fecha"]):
+        df["Fecha"] = df["Fecha"].dt.tz_convert(None)
+    df = df.dropna(subset=["Fecha"])
+
+    hoy    = pd.Timestamp.today().normalize()
+    inicio = hoy - pd.Timedelta(days=29)
+    df     = df[(df["Fecha"] >= inicio) & (df["Fecha"] <= hoy)].sort_values("Fecha")
+
+    if df.empty:
+        return _grafico_vacio(outfile, "Sin datos en los últimos 30 días")
+
+    # --- Calcular columnas auxiliares ---
+    faltantes        = pd.to_numeric(df["Txns Faltantes"], errors="coerce")
+    df["Falt Abs"]   = faltantes.abs()
+    df["Relacion"]   = np.where(faltantes >= 0, "UBA ≥ SBP", "SBP > UBA")
+
+    # Outliers IQR sobre el histórico completo
+    outliers_mask    = detectar_outliers_iqr(df_full)
+    df_full_c        = df_full.copy()
+    df_full_c["Fecha"] = pd.to_datetime(df_full_c["Fecha"], errors="coerce")
+    df_outliers      = df_full_c[outliers_mask].copy()
+    df_outliers["Fecha"] = pd.to_datetime(df_outliers["Fecha"], errors="coerce")
+    df_outliers      = df_outliers[
+        (df_outliers["Fecha"] >= inicio) & (df_outliers["Fecha"] <= hoy)
+    ].copy()
+    df_outliers["Falt Abs"] = pd.to_numeric(
+        df_outliers["Txns Faltantes"], errors="coerce"
+    ).abs()
+
+    # Umbral en unidades absolutas (aproximado: mediana de UBA * UMBRAL)
+    umbral_abs = pd.to_numeric(df["Txns UBA"], errors="coerce").median() * UMBRAL
+
+    paleta_pts = {"UBA ≥ SBP": COLOR_OK, "SBP > UBA": COLOR_ALERTA}
+
+    p = (
+        ggplot(df, aes(x="Fecha", y="Falt Abs")) +
+
+        # Línea de umbral
+        geom_hline(yintercept=umbral_abs,
+                   color=COLOR_ALERTA, linetype="dashed", size=0.8, alpha=0.7) +
+
+        # Línea principal
+        geom_line(color=COLOR_UBA, size=1.1) +
+
+        # Puntos coloreados por relación
+        geom_point(aes(color="Relacion"), size=3) +
+        scale_color_manual(values=paleta_pts) +
+
+        # Outliers IQR marcados con anillo violeta (si los hay)
+        (
+            geom_point(
+                data    = df_outliers,
+                mapping = aes(x="Fecha", y="Falt Abs"),
+                color   = COLOR_OUTLIER,
+                size    = 6,
+                shape   = "o",
+                fill    = "none",
+                stroke  = 1.8,
+            ) if not df_outliers.empty else geom_point(alpha=0)
+        ) +
+
+        # Etiquetas de valor
+        geom_text(
+            aes(label="Falt Abs"),
+            format_string = "{:.0f}",
+            nudge_y = df["Falt Abs"].max() * 0.05 if df["Falt Abs"].max() > 0 else 1,
+            size    = 8,
+            color   = "#333333",
+        ) +
+
+        scale_x_datetime(date_labels="%d-%b", date_breaks="2 days") +
+        scale_y_continuous(labels=lambda lst: [f"{x:,.0f}" for x in lst]) +
+        labs(title="Evolución diaria (últimos 30 días) de Transacciones Faltantes",
+             caption=f"— — Umbral fijo {UMBRAL*100:.1f}%  |  ○ Outlier estadístico (IQR)") +
+        _tema_corporativo() +
+        theme(figure_size=(14, 6))
+    )
+
+    p.save(outfile, dpi=200, verbose=False)
+    return os.path.abspath(outfile)
+
+
+
+def _grafico_vacio(outfile: str, mensaje: str) -> str:
+    """Genera un PNG en blanco con mensaje cuando no hay datos."""
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.text(0.5, 0.5, mensaje, ha="center", va="center", fontsize=14)
+    ax.axis("off")
+    plt.savefig(outfile, dpi=150, bbox_inches="tight", facecolor="white")
+    plt.close()
+    return os.path.abspath(outfile)
+
+
+# ==========================
+# Resumen estadístico para correo
+# ==========================
+def _resumen_outlier_iqr(df_full: pd.DataFrame) -> str:
+    """
+    Genera texto HTML de alerta estadística si el último día es outlier IQR.
+    Incluye el límite calculado para transparencia.
+    """
+    serie = pd.to_numeric(df_full["% Diferencia"], errors="coerce").abs() * 100
+    q1    = serie.quantile(0.25)
+    q3    = serie.quantile(0.75)
+    iqr   = q3 - q1
+    limite = q3 + 1.5 * iqr
+    ultimo = serie.iloc[-1] if not serie.empty else 0.0
+
+    if pd.notna(ultimo) and ultimo > limite:
+        return (
+            f'<p style="color:{COLOR_OUTLIER};font-weight:bold;">'
+            f'⚠ Alerta estadística (IQR): La diferencia de hoy ({ultimo:.2f}%) '
+            f'supera el límite estadístico ({limite:.2f}% = Q3 + 1.5×IQR). '
+            f'Revisar causa raíz.'
+            f'</p>'
+        )
+    return ""
+
+
+# ==========================
+# Helper: bloque HTML por fecha para el correo
+# ==========================
+def _bloque_resumen_fila(fila: pd.Series, df_full: pd.DataFrame) -> str:
+    """
+    Genera el bloque HTML de resumen para una sola fecha procesada.
+    Incluye alerta de umbral fijo.
+    """
+    fecha_str = pd.to_datetime(fila["Fecha"]).strftime("%d/%m/%Y")
+    uba       = int(fila["Txns UBA"])
+    sbp       = int(fila["Txns SBP"])
+    falt      = int(fila["Txns Faltantes"])
+    pct       = float(fila["% Diferencia"])
+
+    umbral_msg = (
+        f'<span style="color:{COLOR_ALERTA};font-weight:bold;">'
+        f'⚠ Superando el umbral del {UMBRAL*100:.1f}%.</span>'
+        if abs(pct) > UMBRAL
+        else f'<span style="color:{COLOR_OK};">✔ No se superó el umbral del {UMBRAL*100:.1f}%.</span>'
+    )
+
+    return f"""
+    <p style="border-left:3px solid #1f77b4;padding-left:10px;margin-bottom:12px;">
+      <b>Fecha: {fecha_str}</b><br/>
+      Transacciones recibidas por UNIBANCA: <b>{sbp:,}</b><br/>
+      Transacciones enviadas desde UNIBANCA: <b>{uba:,}</b><br/>
+      Diferencia absoluta: <b>{abs(falt):,}</b> transacciones faltantes.<br/>
+      Porcentaje de diferencia: <b>{abs(pct)*100:.3f}%</b><br/>
+      {umbral_msg}
+    </p>"""
+
+
+# ==========================
+# Envío de correo
+# ==========================
+def _add_inline_image(mail, img_path: str, cid: str) -> str:
+    """Adjunta una imagen y asigna Content-ID para incrustarla en HTML."""
+    attach = mail.Attachments.Add(Source=img_path)
+    attach.PropertyAccessor.SetProperty(
+        "http://schemas.microsoft.com/mapi/proptag/0x3712001E", cid
+    )
+    attach.PropertyAccessor.SetProperty(
+        "http://schemas.microsoft.com/mapi/proptag/0x3713001E", cid
+    )
+    return cid
+
+
+# ==========================
+# Flujo principal
+# ==========================
+def main():
+    # ── 1. Leer estructura del Excel para columnas ──────────────────────────
+    df_excel = pd.read_excel(RUTA_EXCEL)
+    df2      = pd.DataFrame(columns=df_excel.columns)
+
+    # ── 2. Extraer datos de correos ─────────────────────────────────────────
+    extract_tables_from_emails(df2)
+
+    # ── 3. Insertar fila(s) en Excel sin abrir instancia COM ────────────────
+    #       Esto evita el problema de cierre de archivos abiertos.
+    workbook = load_workbook(filename=RUTA_EXCEL)
+    sheet    = workbook.active
+    table    = sheet.tables["Tabla1"]
+
+    inicio_ref, fin_ref = table.ref.split(":")
+    start_col = "".join(filter(str.isalpha, inicio_ref))
+    start_row = int("".join(filter(str.isdigit, inicio_ref)))
+    end_col   = "".join(filter(str.isalpha, fin_ref))
+    end_row   = int("".join(filter(str.isdigit, fin_ref)))
+
+    fila_referencia = end_row
+
+    for i, row in enumerate(df2.itertuples(index=False, name=None), start=1):
+        sheet.append(row)
+        for j, valor in enumerate(row, start=1):
+            celda_nueva      = sheet.cell(row=fila_referencia + i, column=j)
+            celda_referencia = sheet.cell(row=fila_referencia,     column=j)
+            if celda_referencia.has_style:
+                celda_nueva.font          = copy(celda_referencia.font)
+                celda_nueva.border        = copy(celda_referencia.border)
+                celda_nueva.fill          = copy(celda_referencia.fill)
+                celda_nueva.number_format = copy(celda_referencia.number_format)
+                celda_nueva.protection    = copy(celda_referencia.protection)
+                celda_nueva.alignment     = copy(celda_referencia.alignment)
+
+    nuevas_filas      = len(df2)
+    nueva_ultima_fila = end_row + nuevas_filas
+    table.ref         = f"{start_col}{start_row}:{end_col}{nueva_ultima_fila}"
+
+    # ── NOTA: Ya NO se usa Excel COM (win32 Excel.Application).
+    #    Guardamos directamente con openpyxl. Las fórmulas se recalculan
+    #    la próxima vez que el usuario abra el archivo en Excel.
+    workbook.save(filename=RUTA_EXCEL)
+
+    # ── 4. Cargar histórico completo para gráficos ──────────────────────────
+    df_full = pd.read_excel(RUTA_EXCEL)
+
+    # ── 5. Generar gráficos ─────────────────────────────────────────────────
+    img_path1 = plot_evolucion_mensual(df_full,                   PNG_MENSUAL)
+    img_path2 = plot_evolucion_diaria_ultimos_30_dias(df_full,    PNG_DIARIO30)
+
+    for path in [img_path1, img_path2]:
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"No se generó el gráfico: {path}")
+
+    # ── 6. Preparar datos para el correo ────────────────────────────────────
+    # Si hay múltiples fechas pendientes (lunes, feriados), el asunto
+    # muestra el rango de fechas y el cuerpo lista cada día por separado.
+    df2_sorted = df2.sort_values("Fecha")
+    fechas_procesadas = pd.to_datetime(df2_sorted["Fecha"]).dt.strftime("%d/%m/%Y").tolist()
+
+    if len(df2_sorted) == 1:
+        # Caso normal: un solo día pendiente
+        fila        = df2_sorted.iloc[0]
+        asunto_str  = f"Informe Transacciones de Monitor al {fechas_procesadas[0]}"
+        resumen_html = _bloque_resumen_fila(fila, df_full)
+    else:
+        # Caso múltiple: varios días pendientes (lunes, post-feriado, etc.)
+        rango       = f"{fechas_procesadas[0]} al {fechas_procesadas[-1]}"
+        asunto_str  = f"Informe Transacciones de Monitor del {rango}"
+        resumen_html = "".join(
+            _bloque_resumen_fila(df2_sorted.iloc[i], df_full)
+            for i in range(len(df2_sorted))
+        )
+
+    alerta_iqr_html = _resumen_outlier_iqr(df_full)
+
+    # ── 7. Construir y enviar correo ─────────────────────────────────────────
+    outlook = win32.Dispatch("outlook.application")
+    mail    = outlook.CreateItem(0)
+
+    mail.To = (
+        "roberto.palacios@scotiabank.com.pe; "
+        "Katherine.huapaya@scotiabank.com.pe; "
+        "rodolfo.cordova@scotiabank.com.pe; "
+    )
+    mail.CC         = ""
+    mail.Subject    = asunto_str
+    mail.BodyFormat = 2     # olFormatHTML
+    mail.Importance = 1     # 1 = normal
+
+    cid1 = _add_inline_image(mail, img_path1, "evolucion_txs")
+    cid2 = _add_inline_image(mail, img_path2, "evolucion_txs_diaria")
+
+    mail.HTMLBody = f"""
+    <html>
+    <body style="font-family:Segoe UI,Arial,sans-serif;font-size:12.5px;color:#222;">
+      <p>Estimados,</p>
+      {resumen_html}
+      {alerta_iqr_html}
+      <h4>Evolutivo Mensual de transacciones Faltantes</h4>
+      <img src="cid:{cid1}" style="max-width:100%;height:auto;"/>
+      <h4>Evolutivo diario de transacciones (últimos 30 días)</h4>
+      <img src="cid:{cid2}" style="max-width:100%;height:auto;"/>
+      <p>Saludos,<br/>Mayker Córdova</p>
+    </body>
+    </html>
+    """
+
+    mail.Send()
+    print(f"[OK] Reporte enviado → {asunto_str}")
+
+
+if __name__ == "__main__":
+    main()
