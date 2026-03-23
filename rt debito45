@@ -1,39 +1,54 @@
 import polars as pl
 from datetime import date
 
-# 1. Definimos tus reglas de negocio (asegúrate de que los nombres coincidan exactamente con tus columnas)
-columnas_texto = [
-    "tarjeta_registro", "mcc", "pais_origen", "nombre_comercio", 
-    "general_arco", "bim", "tbr", "indicador_fraude", "usuario"
-]
-columnas_float = ["monto_dolar", "monto_moneda_local"] # Agregué el de moneda local que mencionaste
+# 1. Creamos nuestro diccionario de esquemas (Las reglas de lectura)
+# Le decimos a Polars: "No intentes adivinar, estas columnas son de este tipo sí o sí"
+diccionario_tipos = {
+    "fecha_transaccion": pl.String, # Lo leemos como texto para procesarlo luego
+    "tarjeta_registro": pl.String,
+    "mcc": pl.String,
+    "pais_origen": pl.String,
+    "nombre_comercio": pl.String,
+    "general_arco": pl.String,
+    "bim": pl.String,               # ¡Leído directo como texto, adiós al .0!
+    "tbr": pl.String,
+    "indicador_fraude": pl.String,
+    "usuario": pl.String,
+    "monto_dolar": pl.Float64,
+    "monto_moneda_local": pl.Float64
+}
 
-# 2. Filtramos la v4 (desde el 1 de enero de 2025)
+# 2. Leemos las bases aplicando el diccionario desde el inicio
+# (Polars adivinará el resto de columnas, pero respetará a rajatabla nuestro diccionario)
+df_v4_bruto = pl.read_csv("ruta_base_v4.csv", schema_overrides=diccionario_tipos)
+df_v5_bruto = pl.read_csv("ruta_base_v5.csv", schema_overrides=diccionario_tipos)
+
+# 3. Procesamos las fechas según el formato de cada versión
+# (Ajusta los formatos "%Y%m%d" o "%Y-%m-%d" según cómo venga cada base en la realidad)
+df_v4 = df_v4_bruto.with_columns(
+    pl.col("fecha_transaccion")
+    .str.strip_chars()
+    .str.to_date(format="%Y%m%d", strict=False) # Asumiendo formato 20240530
+)
+
+df_v5 = df_v5_bruto.with_columns(
+    pl.col("fecha_transaccion")
+    .str.strip_chars()
+    .str.to_date(format="%Y-%m-%d", strict=False) # Cambia esto por el formato real de la v5
+)
+
+# 4. Filtramos la v4 desde el 1 de enero de 2025
 df_v4_filtrado = df_v4.filter(
     pl.col("fecha_transaccion") >= date(2025, 1, 1)
 )
 
-# 3. Detectamos las columnas en común automáticamente
+# 5. Intersectamos las columnas y consolidamos
 columnas_comunes = list(set(df_v4_filtrado.columns) & set(df_v5.columns))
 
-# 4. Función para estandarizar tipos de datos solo en las columnas compartidas
-def preparar_para_union(df, comunes):
-    # Validamos qué columnas de nuestras listas realmente existen en este cruce
-    txt_aplicar = [col for col in columnas_texto if col in comunes]
-    flt_aplicar = [col for col in columnas_float if col in comunes]
-    
-    # Seleccionamos las columnas comunes y forzamos el tipo de dato
-    return df.select(comunes).with_columns(
-        pl.col(txt_aplicar).cast(pl.String),
-        pl.col(flt_aplicar).cast(pl.Float64)
-        # Nota: fecha_transaccion no se toca, se queda como Date
-    )
-
-# 5. Aplicamos la limpieza y unimos (UNION ALL)
 df_consolidado = pl.concat([
-    preparar_para_union(df_v4_filtrado, columnas_comunes),
-    preparar_para_union(df_v5, columnas_comunes)
+    df_v4_filtrado.select(columnas_comunes),
+    df_v5.select(columnas_comunes)
 ])
 
-print("Total de filas tras la unión:", df_consolidado.height)
-print("Tipos de datos finales:\n", df_consolidado.schema)
+print("Total de filas consolidadas:", df_consolidado.height)
+print("Esquema final limpio y consistente:\n", df_consolidado.schema)
