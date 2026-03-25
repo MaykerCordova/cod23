@@ -1,0 +1,182 @@
+import polars as pl
+from datetime import date
+
+# ============================================================
+# 0. CONFIGURACIÓN
+# ============================================================
+ARCHIVO = "tu_archivo.xlsx"
+
+HOY  = date(2026, 3, 25)
+MES  = 3
+ANIO = 2026
+
+# Cap de delay (evita outliers extremos)
+MAX_DELAY = 30
+
+# ============================================================
+# 1. CARGA Y NORMALIZACIÓN
+# ============================================================
+df = (
+    pl.read_excel(ARCHIVO)
+    .with_columns([
+        pl.col("fecha_trx").str.to_date(format="%d/%m/%Y", strict=False),
+        pl.col("fecha_cierre").str.to_date(format="%d/%m/%Y", strict=False),
+    ])
+)
+
+# Filtro opcional (si aplica en tu pipeline)
+if "codigo_respuesta" in df.columns:
+    df = df.filter(pl.col("codigo_respuesta") == "000")
+
+# ============================================================
+# 2. CONSTRUCCIÓN DE CURVA DE MADURACIÓN (HISTÓRICA)
+# ============================================================
+delay_curve = (
+    df
+    .filter(
+        pl.col("fecha_trx").is_not_null() &
+        pl.col("fecha_cierre").is_not_null()
+    )
+    .with_columns(
+        (pl.col("fecha_cierre") - pl.col("fecha_trx"))
+        .dt.total_days()
+        .alias("delay")
+    )
+    .filter(pl.col("delay") >= 0)
+    .filter(pl.col("delay") <= MAX_DELAY)
+    .group_by("delay")
+    .agg(pl.len().alias("casos"))
+    .sort("delay")
+    .with_columns(
+        pl.col("casos").cum_sum().alias("acum")
+    )
+)
+
+total_casos = delay_curve.select(pl.col("casos").sum()).item()
+
+delay_curve = delay_curve.with_columns(
+    (pl.col("acum") / total_casos).alias("pct_acum")
+)
+
+# ============================================================
+# 3. FILTRO MES OBJETIVO (FECHA_TRX)
+# ============================================================
+df_mes = (
+    df
+    .filter(
+        (pl.col("fecha_trx").dt.month() == MES) &
+        (pl.col("fecha_trx").dt.year()  == ANIO)
+    )
+    .with_columns(
+        (pl.lit(HOY) - pl.col("fecha_trx"))
+        .dt.total_days()
+        .alias("days_since")
+    )
+)
+
+# ============================================================
+# 4. APLICACIÓN DE FACTOR DE MADURACIÓN
+# ============================================================
+df_mes = (
+    df_mes
+    .join(
+        delay_curve.select(["delay", "pct_acum"]),
+        left_on="days_since",
+        right_on="delay",
+        how="left"
+    )
+    .with_columns([
+        # Si no encuentra delay (muy antiguo), asumir 100% maduro
+        pl.col("pct_acum").fill_null(1.0),
+
+        # Evitar división por cero (casos extremos)
+        pl.when(pl.col("pct_acum") > 0)
+        .then(1 / pl.col("pct_acum"))
+        .otherwise(1.0)
+        .alias("factor")
+    ])
+)
+
+# ============================================================
+# 5. RESULTADOS PRINCIPALES
+# ============================================================
+resultado = (
+    df_mes
+    .select([
+        pl.len().alias("fraude_observado"),
+        pl.col("factor").sum().alias("fraude_ajustado"),
+
+        pl.col("monto_moneda_local").sum().alias("monto_observado"),
+        (pl.col("monto_moneda_local") * pl.col("factor"))
+        .sum()
+        .alias("monto_ajustado")
+    ])
+)
+
+print("\n=== RESULTADO AJUSTADO (MADURACIÓN) ===")
+print(resultado)
+
+# ============================================================
+# 6. KPI DE MADURACIÓN DEL MES
+# ============================================================
+kpi = resultado.with_columns(
+    (pl.col("fraude_observado") / pl.col("fraude_ajustado"))
+    .alias("pct_madurez")
+)
+
+print("\n=== KPI MADURACIÓN ===")
+print(kpi)
+
+# Interpretación:
+# pct_madurez ≈ % del mes que ya está “visible” en el sistema
+
+# ============================================================
+# 7. DIAGNÓSTICO DE CURVA
+# ============================================================
+print("\n=== CURVA DE MADURACIÓN ===")
+print(delay_curve)
+
+# Percentiles (útiles para negocio)
+percentiles = (
+    df
+    .filter(
+        pl.col("fecha_trx").is_not_null() &
+        pl.col("fecha_cierre").is_not_null()
+    )
+    .with_columns(
+        (pl.col("fecha_cierre") - pl.col("fecha_trx"))
+        .dt.total_days()
+        .alias("delay")
+    )
+    .select([
+        pl.col("delay").quantile(0.50).alias("p50"),
+        pl.col("delay").quantile(0.75).alias("p75"),
+        pl.col("delay").quantile(0.90).alias("p90"),
+        pl.col("delay").quantile(0.95).alias("p95"),
+    ])
+)
+
+print("\n=== PERCENTILES DE DELAY ===")
+print(percentiles)
+
+# ============================================================
+# 8. DISTRIBUCIÓN DE MADURACIÓN (MES ACTUAL)
+# ============================================================
+print("\n=== DISTRIBUCIÓN days_since (MES) ===")
+print(
+    df_mes
+    .group_by("days_since")
+    .agg(pl.len().alias("casos"))
+    .sort("days_since")
+)
+
+# ============================================================
+# 9. INTERPRETACIÓN FINAL (OUTPUT CLAVE)
+# ============================================================
+obs = resultado.select("fraude_observado").item()
+adj = resultado.select("fraude_ajustado").item()
+
+print("\n=== INTERPRETACIÓN ===")
+print(f"Fraude observado     : {obs:,.0f}")
+print(f"Fraude ajustado      : {adj:,.0f}")
+print(f"Diferencia estimada  : {adj - obs:,.0f}")
