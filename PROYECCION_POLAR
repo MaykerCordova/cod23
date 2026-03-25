@@ -1,0 +1,258 @@
+import polars as pl
+import numpy as np
+import matplotlib.pyplot as plt
+from datetime import date
+
+# ============================================================
+# CONFIGURACIÓN
+# ============================================================
+ARCHIVO          = "tu_archivo.xlsx"   # ← Cambia por tu ruta
+HOY              = date(2026, 3, 25)
+MES_HOY          = 3
+AÑO_HOY          = 2026
+DIAS_TRANSCURRIDOS = 25
+DIAS_TOTALES_MARZO = 31
+DIAS_RESTANTES   = DIAS_TOTALES_MARZO - DIAS_TRANSCURRIDOS  # 6
+
+# Colores
+COLOR_CONFIRMADO = "#E63946"
+COLOR_PENDIENTE  = "#F4A261"
+COLOR_PROYECTADO = "#A8DADC"
+COLOR_TOTAL      = "#1D3557"
+
+# ============================================================
+# 1. CARGA CON POLARS
+# ============================================================
+df = pl.read_excel(ARCHIVO)
+
+# Convertir fechas — ajusta el formato si es necesario
+# Si viene como "25/03/2026" usar format="%d/%m/%Y"
+# Si viene como "2026-03-25" usar format="%Y-%m-%d"
+df = df.with_columns([
+    pl.col("fecha_trx").str.to_date(format="%d/%m/%Y", strict=False),
+    pl.col("fecha_cierre").str.to_date(format="%d/%m/%Y", strict=False),
+])
+
+# Filtro: solo aprobadas (código respuesta 000)
+# Comenta esta línea si el filtro ya viene aplicado desde tu pipeline
+if "codigo_respuesta" in df.columns:
+    df = df.filter(pl.col("codigo_respuesta") == "000")
+
+print("=== DIAGNÓSTICO ===")
+print(f"Total registros cargados       : {len(df):,}")
+print(f"Con fecha_cierre nula          : {df.filter(pl.col('fecha_cierre').is_null()).height:,}")
+print(f"Con fecha_cierre válida        : {df.filter(pl.col('fecha_cierre').is_not_null()).height:,}")
+fecha_min = df.select(pl.col("fecha_trx").min()).item()
+fecha_max = df.select(pl.col("fecha_trx").max()).item()
+print(f"Rango fecha_trx                : {fecha_min} → {fecha_max}")
+
+# ============================================================
+# 2. VISTA 1 — FECHA DE TRANSACCIÓN
+#    Riesgo: pendientes que se cerrarán en ABRIL (futuro)
+# ============================================================
+print("\n" + "="*60)
+print("VISTA 1: FECHA DE TRANSACCIÓN")
+print("="*60)
+
+marzo_trx = df.filter(
+    (pl.col("fecha_trx").dt.month() == MES_HOY) &
+    (pl.col("fecha_trx").dt.year()  == AÑO_HOY)
+)
+
+# A: Ya cerrados (tienen fecha_cierre)
+cerrados = marzo_trx.filter(pl.col("fecha_cierre").is_not_null())
+A_casos  = cerrados.height
+A_monto  = cerrados.select(pl.col("monto_moneda_local").sum()).item()
+
+# B: Pendientes (sin fecha_cierre — se cerrarán en abril)
+pendientes = marzo_trx.filter(pl.col("fecha_cierre").is_null())
+B_casos    = pendientes.height
+B_monto    = pendientes.select(pl.col("monto_moneda_local").sum()).item()
+
+# C: Proyección pro-rata días restantes
+tasa_diaria_casos = A_casos / DIAS_TRANSCURRIDOS
+tasa_diaria_monto = A_monto / DIAS_TRANSCURRIDOS
+C_casos = tasa_diaria_casos * DIAS_RESTANTES
+C_monto = tasa_diaria_monto * DIAS_RESTANTES
+
+total_trx_casos = A_casos + B_casos + C_casos
+total_trx_monto = A_monto + B_monto + C_monto
+
+print(f"A | Confirmados (cerrados)          : {A_casos:>8,}   S/ {A_monto:>14,.2f}")
+print(f"B | Pendientes (cierran en abril)   : {B_casos:>8,}   S/ {B_monto:>14,.2f}")
+print(f"C | Estimación {DIAS_RESTANTES} días restantes    : {C_casos:>8,.0f}   S/ {C_monto:>14,.2f}")
+print(f"{'TOTAL PROYECTADO (fecha_trx)':<40}: {total_trx_casos:>8,.0f}   S/ {total_trx_monto:>14,.2f}")
+
+# ============================================================
+# 3. VISTA 2 — FECHA DE CIERRE
+#    Riesgo: cierres de marzo que vienen de meses ANTERIORES
+# ============================================================
+print("\n" + "="*60)
+print("VISTA 2: FECHA DE CIERRE")
+print("="*60)
+
+marzo_cierre = df.filter(
+    pl.col("fecha_cierre").is_not_null() &
+    (pl.col("fecha_cierre").dt.month() == MES_HOY) &
+    (pl.col("fecha_cierre").dt.year()  == AÑO_HOY)
+)
+
+# Origen por mes de transacción
+origen = (
+    marzo_cierre
+    .with_columns(
+        pl.col("fecha_trx").dt.strftime("%Y-%m").alias("mes_trx")
+    )
+    .group_by("mes_trx")
+    .agg([
+        pl.len().alias("casos"),
+        pl.col("monto_moneda_local").sum().alias("monto")
+    ])
+    .sort("mes_trx")
+)
+
+print("\nOrigen de los cierres de marzo (¿de cuándo son las trx?):")
+print(origen)
+
+ya_cerrados_casos = marzo_cierre.height
+ya_cerrados_monto = marzo_cierre.select(pl.col("monto_moneda_local").sum()).item()
+
+tasa_cierre_casos = ya_cerrados_casos / DIAS_TRANSCURRIDOS
+tasa_cierre_monto = ya_cerrados_monto / DIAS_TRANSCURRIDOS
+proy_cierre_casos = tasa_cierre_casos * DIAS_TOTALES_MARZO
+proy_cierre_monto = tasa_cierre_monto * DIAS_TOTALES_MARZO
+
+print(f"\nYa cerrados en marzo               : {ya_cerrados_casos:>8,}   S/ {ya_cerrados_monto:>14,.2f}")
+print(f"PROYECTADO al 31 marzo (cierre)    : {proy_cierre_casos:>8,.0f}   S/ {proy_cierre_monto:>14,.2f}")
+
+# ============================================================
+# 4. CURVA DE DESARROLLO HISTÓRICA (lag en días)
+# ============================================================
+print("\n" + "="*60)
+print("CURVA DE DESARROLLO (lag histórico)")
+print("="*60)
+
+historico = (
+    df
+    .filter(
+        pl.col("fecha_cierre").is_not_null() &
+        pl.col("fecha_trx").is_not_null()
+    )
+    .with_columns(
+        (pl.col("fecha_cierre") - pl.col("fecha_trx"))
+        .dt.total_days()
+        .alias("lag_dias")
+    )
+    .filter(pl.col("lag_dias") >= 0)
+)
+
+lag_vals = historico.select("lag_dias").to_series().to_list()
+for p in [50, 75, 90, 95, 99]:
+    print(f"  P{p}: {np.percentile(lag_vals, p):.0f} días")
+print(f"  Promedio : {np.mean(lag_vals):.1f} días")
+print(f"  Mediana  : {np.median(lag_vals):.1f} días")
+
+# ============================================================
+# 5. GRÁFICAS
+# ============================================================
+fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+fig.patch.set_facecolor("#0F1923")
+for ax in axes.flat:
+    ax.set_facecolor("#1A2535")
+    ax.tick_params(colors="white")
+    ax.spines[:].set_color("#2E3D52")
+
+fig.suptitle("Proyección Fraude — Marzo 2026",
+             fontsize=18, fontweight="bold", color="white", y=0.98)
+
+# --- Gráfica 1: Composición fecha_trx ---
+ax1 = axes[0, 0]
+cat = ["Proyección\nMarzo"]
+ax1.bar(cat, [A_casos], color=COLOR_CONFIRMADO, label="A | Confirmados")
+ax1.bar(cat, [B_casos], bottom=[A_casos], color=COLOR_PENDIENTE, label="B | Pendientes")
+ax1.bar(cat, [C_casos], bottom=[A_casos + B_casos], color=COLOR_PROYECTADO, label="C | Días restantes")
+ax1.axhline(total_trx_casos, color="white", linestyle="--", linewidth=1.5, alpha=0.7)
+ax1.text(0, total_trx_casos * 1.03, f"Total: {total_trx_casos:,.0f}",
+         ha="center", color="white", fontweight="bold")
+ax1.set_title("Vista Fecha Transacción\nComposición proyección", color="white", fontsize=12)
+ax1.set_ylabel("Casos de fraude", color="white")
+ax1.legend(facecolor="#1A2535", labelcolor="white", fontsize=9)
+
+# --- Gráfica 2: Acumulado diario + proyección ---
+ax2 = axes[0, 1]
+dias_reales    = list(range(1, DIAS_TRANSCURRIDOS + 1))
+acumulado_sim  = [round(A_casos * (d / DIAS_TRANSCURRIDOS)) for d in dias_reales]
+dias_futuros   = list(range(DIAS_TRANSCURRIDOS, DIAS_TOTALES_MARZO + 1))
+proyeccion_sim = [A_casos + round(C_casos * (d - DIAS_TRANSCURRIDOS) / DIAS_RESTANTES)
+                  for d in dias_futuros]
+
+ax2.plot(dias_reales, acumulado_sim, color=COLOR_CONFIRMADO, linewidth=2.5, label="Acumulado real")
+ax2.plot(dias_futuros, proyeccion_sim, color=COLOR_PROYECTADO, linewidth=2.5,
+         linestyle="--", label="Proyección")
+ax2.axvline(DIAS_TRANSCURRIDOS, color="white", linestyle=":", alpha=0.5)
+ax2.text(DIAS_TRANSCURRIDOS + 0.3, max(acumulado_sim) * 0.5, "Hoy", color="white", fontsize=9)
+ax2.set_title("Vista Fecha Transacción\nAcumulado diario + proyección", color="white", fontsize=12)
+ax2.set_xlabel("Día de marzo", color="white")
+ax2.set_ylabel("Casos acumulados", color="white")
+ax2.legend(facecolor="#1A2535", labelcolor="white", fontsize=9)
+
+# --- Gráfica 3: Origen cierres de marzo ---
+ax3 = axes[1, 0]
+if origen.height > 0:
+    meses  = origen["mes_trx"].to_list()
+    casos  = origen["casos"].to_list()
+    colores_origen = plt.cm.RdYlBu(np.linspace(0.2, 0.8, len(meses)))
+    bars = ax3.barh(meses, casos, color=colores_origen)
+    for bar, val in zip(bars, casos):
+        ax3.text(bar.get_width() * 1.02, bar.get_y() + bar.get_height() / 2,
+                 f"{val:,}", va="center", color="white", fontsize=9)
+ax3.set_title("Vista Fecha Cierre\n¿De qué mes vienen los cierres de marzo?",
+              color="white", fontsize=12)
+ax3.set_xlabel("Casos cerrados en marzo", color="white")
+
+# --- Gráfica 4: Curva de desarrollo (lag) ---
+ax4 = axes[1, 1]
+lag_arr = np.array(lag_vals)
+bins    = range(0, min(int(np.percentile(lag_arr, 99)) + 2, 60))
+ax4.hist(lag_arr, bins=bins, color=COLOR_CONFIRMADO, alpha=0.8, edgecolor="#0F1923")
+for p, color in [(50, "white"), (90, COLOR_PROYECTADO), (95, COLOR_PENDIENTE)]:
+    val = np.percentile(lag_arr, p)
+    ax4.axvline(val, color=color, linestyle="--", linewidth=1.5)
+    ax4.text(val + 0.3, ax4.get_ylim()[1] * 0.85, f"P{p}={val:.0f}d",
+             color=color, fontsize=8)
+ax4.set_title("Curva de desarrollo\nLag entre fecha_trx y fecha_cierre",
+              color="white", fontsize=12)
+ax4.set_xlabel("Días de lag", color="white")
+ax4.set_ylabel("Frecuencia", color="white")
+
+plt.tight_layout(rect=[0, 0, 1, 0.96])
+plt.savefig("proyeccion_fraude_marzo.png", dpi=150, bbox_inches="tight",
+            facecolor="#0F1923")
+plt.show()
+print("\n✓ Gráfica guardada: proyeccion_fraude_marzo.png")
+
+# ============================================================
+# 6. EXPORT CSV PARA POWER BI
+# ============================================================
+resultado = pl.DataFrame({
+    "vista": ["fecha_trx", "fecha_trx", "fecha_trx", "fecha_trx",
+              "fecha_cierre", "fecha_cierre"],
+    "componente": ["A_confirmados", "B_pendientes", "C_proyeccion", "TOTAL",
+                   "ya_cerrados", "TOTAL"],
+    "descripcion": [
+        "Fraudes cerrados confirmados",
+        "Pendientes (cierran en abril)",
+        f"Estimación {DIAS_RESTANTES} días restantes",
+        "Total proyectado marzo (fecha_trx)",
+        "Cerrados en marzo hasta hoy",
+        "Total proyectado marzo (fecha_cierre)"
+    ],
+    "casos": [A_casos, B_casos, round(C_casos), round(total_trx_casos),
+              ya_cerrados_casos, round(proy_cierre_casos)],
+    "monto_moneda_local": [round(A_monto, 2), round(B_monto, 2),
+                           round(C_monto, 2), round(total_trx_monto, 2),
+                           round(ya_cerrados_monto, 2), round(proy_cierre_monto, 2)]
+})
+
+resultado.write_csv("proyeccion_marzo_2026.csv")
+print("✓ CSV exportado: proyeccion_marzo_2026.csv")
