@@ -1,0 +1,266 @@
+import win32com.client
+import sqlite3
+import os
+import re
+from datetime import datetime
+from openpyxl import Workbook
+
+# =========================
+# CONFIG
+# =========================
+CONFIG = {
+    "DB": r"C:\Users\jcordova\Scotiabank\Fraude\bitacora.db",
+    "EXCEL": r"C:\Users\jcordova\Scotiabank\Fraude\Bitacora_Output.xlsx",
+    "FOLDER_SOL": "Bitacora_Solicitudes",
+    "FOLDER_RESP": "Bitacora_Respuestas",
+    "REGEX_ID": r"\[(ID-[\w-]+)\]"
+}
+
+# =========================
+# DB LAYER
+# =========================
+class DB:
+
+    def __init__(self, path):
+        self.path = path
+        self.init()
+
+    def connect(self):
+        return sqlite3.connect(self.path)
+
+    def init(self):
+        with self.connect() as conn:
+            c = conn.cursor()
+
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS bitacora (
+                id_sistema TEXT PRIMARY KEY,
+                correlativo INTEGER,
+                fecha_solicitud TEXT,
+                hora_solicitud TEXT,
+                herramienta TEXT,
+                accion TEXT,
+                maker TEXT,
+                checker TEXT,
+                estado TEXT
+            )
+            """)
+
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS eventos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id_sistema TEXT,
+                tipo TEXT,
+                fecha TEXT,
+                usuario TEXT,
+                payload TEXT
+            )
+            """)
+
+    def get_correlativo(self):
+        with self.connect() as conn:
+            c = conn.cursor()
+            c.execute("SELECT MAX(correlativo) FROM bitacora")
+            r = c.fetchone()[0]
+            return 1 if r is None else r + 1
+
+    def existe(self, id_sys):
+        with self.connect() as conn:
+            c = conn.cursor()
+            c.execute("SELECT 1 FROM bitacora WHERE id_sistema=?", (id_sys,))
+            return c.fetchone() is not None
+
+    def insertar(self, data):
+        with self.connect() as conn:
+            c = conn.cursor()
+            c.execute("""
+            INSERT INTO bitacora VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, data)
+
+    def aprobar(self, id_sys, checker):
+        with self.connect() as conn:
+            c = conn.cursor()
+            c.execute("""
+            UPDATE bitacora
+            SET estado='COMPLETADO',
+                checker=?
+            WHERE id_sistema=?
+            """, (checker, id_sys))
+
+    def registrar_evento(self, id_sys, tipo, usuario, payload=""):
+        with self.connect() as conn:
+            c = conn.cursor()
+            c.execute("""
+            INSERT INTO eventos (id_sistema, tipo, fecha, usuario, payload)
+            VALUES (?, ?, ?, ?, ?)
+            """, (id_sys, tipo, datetime.now().isoformat(), usuario, payload))
+
+    def fetch_bitacora(self):
+        with self.connect() as conn:
+            c = conn.cursor()
+            c.execute("""
+            SELECT id_sistema, correlativo, fecha_solicitud, hora_solicitud,
+                   herramienta, accion, maker, checker, estado
+            FROM bitacora
+            ORDER BY correlativo
+            """)
+            return c.fetchall()
+
+# =========================
+# OUTLOOK
+# =========================
+class Outlook:
+
+    def __init__(self):
+        self.ns = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+        self.inbox = self.ns.GetDefaultFolder(6)
+
+    def folder(self, name):
+        return self.inbox.Folders[name]
+
+    def unread(self, folder):
+        return [m for m in folder.Items if m.UnRead]
+
+# =========================
+# PARSER
+# =========================
+def extraer_id(texto):
+    match = re.search(CONFIG["REGEX_ID"], texto)
+    return match.group(1).upper() if match else None
+
+def es_aprobacion(body):
+    body = body.upper()
+
+    if "NO APROBADO" in body:
+        return False
+
+    palabras = ["APROBADO", "APROBADA", "OK", "VOBO", "CONFORME"]
+
+    return any(p in body for p in palabras)
+
+# =========================
+# EXCEL OUTPUT
+# =========================
+def exportar_excel(data):
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Bitacora"
+
+    headers = [
+        "ID_Sistema", "Correlativo", "Fecha", "Hora",
+        "Herramienta", "Accion", "Maker", "Checker", "Estado"
+    ]
+
+    ws.append(headers)
+
+    for row in data:
+        ws.append(row)
+
+    # Autofit básico
+    for col in ws.columns:
+        max_length = 0
+        col_letter = col[0].column_letter
+
+        for cell in col:
+            try:
+                if cell.value:
+                    max_length = max(max_length, len(str(cell.value)))
+            except:
+                pass
+
+        ws.column_dimensions[col_letter].width = min(max_length + 2, 40)
+
+    wb.save(CONFIG["EXCEL"])
+
+# =========================
+# MAIN
+# =========================
+def main():
+
+    print("Iniciando proceso bitácora...")
+
+    db = DB(CONFIG["DB"])
+    outlook = Outlook()
+
+    procesados = 0
+
+    # =====================
+    # FASE 1: SOLICITUDES
+    # =====================
+    try:
+        sol_folder = outlook.folder(CONFIG["FOLDER_SOL"])
+        mensajes = sorted(outlook.unread(sol_folder), key=lambda x: x.ReceivedTime)
+
+        for m in mensajes:
+
+            id_sys = extraer_id(m.Subject)
+            if not id_sys:
+                continue
+
+            if db.existe(id_sys):
+                continue
+
+            correlativo = db.get_correlativo()
+
+            data = (
+                id_sys,
+                correlativo,
+                m.SentOn.strftime("%d/%m/%Y"),
+                m.SentOn.strftime("%H:%M"),
+                "NA",
+                "NA",
+                m.SenderName,
+                "",
+                "PENDIENTE"
+            )
+
+            db.insertar(data)
+            db.registrar_evento(id_sys, "CREACION", m.SenderName, m.Subject)
+
+            m.UnRead = False
+            procesados += 1
+
+    except Exception as e:
+        print(f"Error en solicitudes: {e}")
+
+    # =====================
+    # FASE 2: APROBACIONES
+    # =====================
+    try:
+        resp_folder = outlook.folder(CONFIG["FOLDER_RESP"])
+        mensajes = outlook.unread(resp_folder)
+
+        for m in mensajes:
+
+            id_sys = extraer_id(m.Subject)
+            if not id_sys:
+                continue
+
+            if es_aprobacion(m.Body):
+
+                db.aprobar(id_sys, m.SenderName)
+                db.registrar_evento(id_sys, "APROBACION", m.SenderName, m.Body)
+
+                m.UnRead = False
+                procesados += 1
+
+    except Exception as e:
+        print(f"Error en aprobaciones: {e}")
+
+    # =====================
+    # EXPORT FINAL
+    # =====================
+    try:
+        data = db.fetch_bitacora()
+        exportar_excel(data)
+    except Exception as e:
+        print(f"Error exportando Excel: {e}")
+
+    print(f"Proceso finalizado. Registros procesados: {procesados}")
+
+# =========================
+# RUN
+# =========================
+if __name__ == "__main__":
+    main()
