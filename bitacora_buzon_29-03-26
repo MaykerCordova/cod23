@@ -1,0 +1,293 @@
+import win32com.client
+import sqlite3
+import re
+from datetime import datetime
+from openpyxl import Workbook
+
+# =========================
+# CONFIG
+# =========================
+CONFIG = {
+    "DB": r"C:\Users\jcordova\Scotiabank\Fraude\sla_banca_privada.db",
+    "EXCEL": r"C:\Users\jcordova\Scotiabank\Fraude\SLA_Output.xlsx",
+    "FOLDER_SOL": "SLA_ENTRADA",
+    "FOLDER_RESP": "SLA_RESPUESTA"
+}
+
+# =========================
+# ANALISTAS AUTORIZADOS
+# =========================
+ANALISTAS = [
+    "analista1@banco.com",
+    "analista2@banco.com",
+    "analista3@banco.com"
+]
+
+# =========================
+# SLA
+# =========================
+SLA_MAP = {
+    "PRIMERA INSTANCIA": 5,
+    "PREMIUM": 2,
+    "SEGUNDA INSTANCIA": 3
+}
+
+def calcular_sla(instancia):
+    return SLA_MAP.get(instancia.upper(), 5)
+
+# =========================
+# DB
+# =========================
+class DB:
+
+    def __init__(self, path):
+        self.path = path
+        self.init()
+
+    def connect(self):
+        return sqlite3.connect(self.path)
+
+    def init(self):
+        with self.connect() as conn:
+            c = conn.cursor()
+
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS casos (
+                id TEXT PRIMARY KEY,
+                dni TEXT,
+                nombre TEXT,
+                segmento TEXT,
+                instancia TEXT,
+                producto TEXT,
+                reportado_por TEXT,
+                fecha_recepcion TEXT,
+                fecha_respuesta TEXT,
+                estado TEXT,
+                sla_dias INTEGER,
+                dias_transcurridos INTEGER,
+                cumple_sla TEXT,
+                observaciones TEXT
+            )
+            """)
+
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS eventos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                caso_id TEXT,
+                tipo TEXT,
+                fecha TEXT,
+                usuario TEXT
+            )
+            """)
+
+    def existe(self, id_):
+        with self.connect() as conn:
+            c = conn.cursor()
+            c.execute("SELECT 1 FROM casos WHERE id=?", (id_,))
+            return c.fetchone() is not None
+
+    def insertar(self, data):
+        with self.connect() as conn:
+            c = conn.cursor()
+            c.execute("""
+            INSERT INTO casos VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, data)
+
+    def actualizar(self, id_, fecha_resp, dias, cumple, obs):
+        with self.connect() as conn:
+            c = conn.cursor()
+            c.execute("""
+            UPDATE casos
+            SET fecha_respuesta=?,
+                estado='ATENDIDO',
+                dias_transcurridos=?,
+                cumple_sla=?,
+                observaciones=?
+            WHERE id=?
+            """, (fecha_resp, dias, cumple, obs, id_))
+
+    def evento(self, id_, tipo, usuario):
+        with self.connect() as conn:
+            c = conn.cursor()
+            c.execute("""
+            INSERT INTO eventos (caso_id, tipo, fecha, usuario)
+            VALUES (?, ?, ?, ?)
+            """, (id_, tipo, datetime.now().isoformat(), usuario))
+
+    def get(self, id_):
+        with self.connect() as conn:
+            c = conn.cursor()
+            c.execute("SELECT fecha_recepcion, sla_dias FROM casos WHERE id=?", (id_,))
+            return c.fetchone()
+
+    def fetch_all(self):
+        with self.connect() as conn:
+            c = conn.cursor()
+            c.execute("SELECT * FROM casos")
+            return c.fetchall()
+
+# =========================
+# PARSER
+# =========================
+def extraer_campo(texto, campo):
+    pattern = fr"{campo}:\s*(.*)"
+    m = re.search(pattern, texto, re.IGNORECASE)
+    return m.group(1).strip() if m else ""
+
+# =========================
+# VALIDACIÓN DE RESPUESTA
+# =========================
+def es_analista_valido(mail):
+    try:
+        sender = mail.SenderEmailAddress.lower()
+        return sender in ANALISTAS
+    except:
+        return False
+
+def contiene_keyword_respuesta(body):
+    body = body.upper()
+    return ("RESPUESTA:" in body) or ("ATENDIDO:" in body)
+
+def es_respuesta_valida(mail):
+    # capa 1: remitente
+    if not es_analista_valido(mail):
+        return False
+
+    # capa 2: keyword (opcional pero recomendado)
+    if not contiene_keyword_respuesta(mail.Body):
+        return False
+
+    return True
+
+# =========================
+# TIEMPO
+# =========================
+def calcular_dias(f1, f2):
+    d1 = datetime.strptime(f1, "%d/%m/%Y %H:%M")
+    d2 = datetime.strptime(f2, "%d/%m/%Y %H:%M")
+    return (d2 - d1).days
+
+# =========================
+# EXCEL
+# =========================
+def exportar_excel(data):
+    wb = Workbook()
+    ws = wb.active
+
+    headers = [
+        "ID", "DNI", "Nombre", "Segmento", "Instancia",
+        "Producto", "Reportado Por",
+        "Fecha Recepción", "Fecha Respuesta",
+        "Estado", "SLA", "Días", "Cumple", "Observaciones"
+    ]
+
+    ws.append(headers)
+
+    for row in data:
+        ws.append(row)
+
+    wb.save(CONFIG["EXCEL"])
+
+# =========================
+# MAIN
+# =========================
+def main():
+
+    db = DB(CONFIG["DB"])
+    outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+    inbox = outlook.GetDefaultFolder(6)
+
+    # =====================
+    # SOLICITUDES
+    # =====================
+    folder = inbox.Folders[CONFIG["FOLDER_SOL"]]
+
+    for m in folder.Items:
+
+        if not m.UnRead:
+            continue
+
+        id_ = m.ConversationID
+
+        if db.existe(id_):
+            continue
+
+        body = m.Body
+
+        dni = extraer_campo(body, "DNI")
+        nombre = extraer_campo(body, "NOMBRE")
+        segmento = extraer_campo(body, "SEGMENTO")
+        instancia = extraer_campo(body, "INSTANCIA")
+        producto = extraer_campo(body, "PRODUCTO")
+        reportado = extraer_campo(body, "REPORTADO POR")
+
+        fecha = m.ReceivedTime.strftime("%d/%m/%Y %H:%M")
+
+        sla = calcular_sla(instancia)
+
+        data = (
+            id_,
+            dni,
+            nombre,
+            segmento,
+            instancia,
+            producto,
+            reportado,
+            fecha,
+            "",
+            "PENDIENTE",
+            sla,
+            0,
+            "",
+            ""
+        )
+
+        db.insertar(data)
+        db.evento(id_, "CREACION", m.SenderName)
+
+        m.UnRead = False
+
+    # =====================
+    # RESPUESTAS
+    # =====================
+    folder = inbox.Folders[CONFIG["FOLDER_RESP"]]
+
+    for m in folder.Items:
+
+        if not m.UnRead:
+            continue
+
+        id_ = m.ConversationID
+
+        if not db.existe(id_):
+            continue
+
+        if not es_respuesta_valida(m):
+            continue
+
+        fecha_resp = m.ReceivedTime.strftime("%d/%m/%Y %H:%M")
+
+        row = db.get(id_)
+        if not row:
+            continue
+
+        fecha_ini, sla = row
+
+        dias = calcular_dias(fecha_ini, fecha_resp)
+        cumple = "SI" if dias <= sla else "NO"
+
+        db.actualizar(id_, fecha_resp, dias, cumple, m.Body[:500])
+        db.evento(id_, "RESPUESTA", m.SenderName)
+
+        m.UnRead = False
+
+    # =====================
+    # EXPORT
+    # =====================
+    data = db.fetch_all()
+    exportar_excel(data)
+
+    print("Proceso SLA completo OK")
+
+if __name__ == "__main__":
+    main()
