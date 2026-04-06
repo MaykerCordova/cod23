@@ -1,0 +1,7 @@
+let
+    Origen = Parquet.Document(File.Contents("C:\Users\s4930359\Data_Herramientas\data\silver\rt_debito_consolidated.parquet")),
+    #"Tipo cambiado" = Table.TransformColumnTypes(Origen,{{"USUARIO", type text}}),
+    #"Errores reemplazados" = Table.ReplaceErrorValues(#"Tipo cambiado",{{"ACF-FECHA TRX", "NA"}}),
+    #"Tipo cambiado2" = Table.TransformColumnTypes(#"Errores reemplazados",{{"ACF-MCC +", type text}, {"ACF-BIN", type text}, {"ACF-Entry Mode", type text}})
+in
+    #"Tipo cambiado2"
