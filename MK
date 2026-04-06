@@ -1,0 +1,8 @@
+let
+    Origen = Parquet.Document(File.Contents("C:\Users\s4930359\Data_Herramientas\data\silver\vrm_consolidated.parquet")),
+    #"Tipo cambiado" = Table.TransformColumnTypes(Origen,{{"Fecha", type date}}),
+    #"Primeros caracteres insertados" = Table.AddColumn(#"Tipo cambiado", "Primeros caracteres", each Text.Start([BIN], 6), type text),
+    #"Columnas con nombre cambiado" = Table.RenameColumns(#"Primeros caracteres insertados",{{"Primeros caracteres", "BIN_6"}}),
+    #"Columna combinada insertada" = Table.AddColumn(#"Columnas con nombre cambiado", "llave1", each Text.Combine({[TARJETA], Text.From([Fecha], "es-PE"), [NOMBRE DE COMERCIO]}, "_"), type text)
+in
+    #"Columna combinada insertada"
