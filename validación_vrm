@@ -1,0 +1,56 @@
+import polars as pl
+from vrm_pipeline_incremental import Config
+
+# Leer el Silver actual
+df = pl.read_parquet(Config.SILVER_PARQUET)
+
+print("=" * 60)
+print("VALIDACIÓN DEL SILVER")
+print("=" * 60)
+print(f"Shape: {df.shape[0]:,} filas × {df.shape[1]} columnas")
+print(f"Rango de fechas: {df['Fecha'].min()} a {df['Fecha'].max()}")
+
+# 1. Conteo por fecha para ver el 31
+print("\n--- REGISTROS POR FECHA (últimos 5 días) ---")
+print(
+    df.group_by("Fecha")
+    .agg(pl.len().alias("registros"))
+    .sort("Fecha", descending=True)
+    .head(5)
+)
+
+# 2. Validar Entidad
+print("\n--- ENTIDAD ---")
+print(df.group_by("Entidad").agg(pl.len().alias("count")))
+
+# 3. Validar Gestion
+print("\n--- GESTION ---")
+print(df.group_by("Gestion").agg(pl.len().alias("count")))
+
+# 4. Validar Fuente
+print("\n--- FUENTE ---")
+print(df["Fuente"].value_counts())
+
+# 5. Validar Cuenta
+print("\n--- CUENTA ---")
+print(df["Cuenta"].value_counts())
+
+# 6. Validar los 3 scores (null en histórico, con valor en el 31)
+print("\n--- SCORES (histórico vs día 31) ---")
+df_historico = df.filter(pl.col("Fecha") < pl.date(2026, 3, 31))
+df_nuevo = df.filter(pl.col("Fecha") == pl.date(2026, 3, 31))
+
+print(f"Histórico - SCORE_AARS nulls: {df_historico['SCORE_AARS'].null_count()} de {df_historico.shape[0]}")
+print(f"Día 31    - SCORE_AARS nulls: {df_nuevo['SCORE_AARS'].null_count()} de {df_nuevo.shape[0]}")
+print(f"Día 31    - SCORE_AARS ejemplo: {df_nuevo['SCORE_AARS'].head(3).to_list()}")
+print(f"Día 31    - SCORE_VCAS ejemplo: {df_nuevo['SCORE_VCAS'].head(3).to_list()}")
+print(f"Día 31    - SCORE_VAAI ejemplo: {df_nuevo['SCORE_VAAI'].head(3).to_list()}")
+
+# 7. Validar AnoMes_reporte y Dia_reporte del 31
+print("\n--- CAMPOS DERIVADOS (día 31) ---")
+print(df_nuevo.select("Fecha", "Dia_reporte", "AnoMes_reporte").head(5))
+
+# 8. Schema completo
+print("\n--- SCHEMA ---")
+for col in df.columns:
+    print(f"  {col:<30} {str(df[col].dtype):<15} nulls: {df[col].null_count()}")
