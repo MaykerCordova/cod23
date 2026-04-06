@@ -1,0 +1,22 @@
+Exacto, uno por uno cambiando la ruta. Pero puedes hacerlo más rápido con un loop. Si todos los Excels están en la misma carpeta:
+from rt_credito_pipeline_incremental import run_daily
+from pathlib import Path
+
+carpeta = Path(r"C:\FRAUDES\HERRAMIENTAS\RT_TC_UBA\DATA")
+
+# Listar todos los Excel que quieras cargar (del 30 en adelante)
+archivos = sorted(carpeta.glob("*.xlsx"))
+
+# Ver qué archivos hay
+for f in archivos:
+    print(f.name)
+
+Primero corre eso para ver los archivos disponibles. Después, si quieres cargar varios de una vez:
+for archivo in archivos:
+    print(f"\n{'='*60}")
+    print(f"Procesando: {archivo.name}")
+    run_daily(
+        excel_path=str(archivo),
+        fecha_descarga=None  # usa la fecha de hoy como referencia en Bronze
+    )
+La deduplicación se encarga de que no se duplique nada si algún Excel trae datos que ya están en el Silver. Pero primero corre el bootstrap para tener la base del Access, y después el loop para los Excels nuevos.
