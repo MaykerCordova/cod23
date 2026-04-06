@@ -1,0 +1,29 @@
+import polars as pl
+
+# Leer un CSV crudo para ver las columnas originales
+df_raw = pl.read_csv(
+    r"C:\Users\s4930359\Downloads\MemberDefinedReport1775427582475.csv",
+    encoding="latin-1",
+    infer_schema_length=0,
+    truncate_ragged_lines=True,
+    ignore_errors=True,
+    n_rows=5
+)
+
+# Ver las columnas relacionadas con BIN
+bin_cols = [c for c in df_raw.columns if "BIN" in c.upper() or "bin" in c.lower()]
+print("Columnas con BIN:", bin_cols)
+for col in bin_cols:
+    print(f"  {col}: {df_raw[col].to_list()}")
+
+# Ver Account Number (de donde sale TARJETA)
+print("\nAccount Number:", df_raw["Account Number"].to_list())
+
+# Ver columnas de analista/status
+status_cols = [c for c in df_raw.columns if "Statused" in c or "Status" in c]
+print("\nColumnas de Status:", status_cols)
+for col in status_cols:
+    print(f"  {col}: {df_raw[col].to_list()}")
+
+# Ver la columna que Marcial usaba para calificación
+print("\nStatus:", df_raw["Status"].to_list() if "Status" in df_raw.columns else "NO EXISTE")
