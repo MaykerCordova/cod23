@@ -21,6 +21,8 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 import warnings
+import os
+import glob
 warnings.filterwarnings("ignore")
 
 from sklearn.linear_model import LogisticRegression
@@ -36,6 +38,15 @@ try:
     HAS_LGB = True
 except ImportError:
     HAS_LGB = False
+
+try:
+    import janitor  # pyjanitor — limpieza de nombres de columnas
+    HAS_JANITOR = True
+except ImportError:
+    HAS_JANITOR = False
+
+# ── Carpeta data/ relativa al app.py ──────────────────────────────────────
+DATA_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 
 # ══════════════════════════════════════════════════════════════════════
 # CONFIGURACIÓN DE PÁGINA
@@ -75,26 +86,70 @@ with st.sidebar:
     st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/7/7b/Scotiabank.svg/320px-Scotiabank.svg.png", width=160)
     st.markdown("## ⚙️ Configuración")
 
-    st.markdown("### 📁 Datos")
-    use_synthetic = st.checkbox("Usar datos sintéticos (demo)", value=True)
-    uploaded_file = None
+    # ── FUENTE DE DATOS ───────────────────────────────────────────────
+    st.markdown("### 📁 Fuente de datos")
+    fuente = st.radio("Origen", ["📂 Carpeta data/", "⬆️ Subir archivo", "🧪 Datos sintéticos"],
+                      index=0)
+
+    uploaded_file  = None
+    selected_file  = None
+    use_synthetic  = False
+
+    if fuente == "🧪 Datos sintéticos":
+        use_synthetic = True
+
+    elif fuente == "⬆️ Subir archivo":
+        uploaded_file = st.file_uploader("Selecciona tu Excel/CSV",
+                                          type=["csv","xlsx","xls"])
+
+    else:  # Carpeta data/
+        os.makedirs(DATA_FOLDER, exist_ok=True)
+        archivos = sorted(
+            glob.glob(os.path.join(DATA_FOLDER, "*.xlsx")) +
+            glob.glob(os.path.join(DATA_FOLDER, "*.xls"))  +
+            glob.glob(os.path.join(DATA_FOLDER, "*.csv"))
+        )
+        if archivos:
+            nombres = [os.path.basename(f) for f in archivos]
+            seleccion = st.selectbox("Archivo en data/", nombres)
+            selected_file = archivos[nombres.index(seleccion)]
+            st.caption(f"📄 `{selected_file}`")
+        else:
+            st.warning(f"No hay archivos en:\n`{DATA_FOLDER}`\n\nPega tu Excel ahí y recarga.")
+            use_synthetic = True
+
+    # ── OPCIONES DE LECTURA ───────────────────────────────────────────
     if not use_synthetic:
-        uploaded_file = st.file_uploader("Export del Monitor (CSV/Excel)", type=["csv","xlsx","xls"])
+        st.markdown("##### Opciones de lectura")
+        skip_rows   = st.number_input("Filas a saltar (skiprows)", 0, 20, 4, 1,
+                                       help="Tu Monitor exporta 4 filas de cabecera antes de los datos")
+        use_janitor = st.checkbox("🧹 Limpiar nombres con pyjanitor",
+                                   value=HAS_JANITOR,
+                                   disabled=not HAS_JANITOR,
+                                   help="Convierte 'Merchant Name' → 'merchant_name'")
+        if not HAS_JANITOR:
+            st.caption("pyjanitor no instalado.\n`pip install pyjanitor`")
+    else:
+        skip_rows   = 4
+        use_janitor = False
 
     st.markdown("---")
-    st.markdown("### 🗂️ Mapeo de Columnas")
-    st.caption("Ajusta si tus columnas tienen nombres distintos")
 
-    col_fecha    = st.text_input("Fecha transacción",  "fecha_transaccion")
-    col_monto    = st.text_input("Monto",               "monto")
-    col_comercio = st.text_input("Comercio",            "comercio")
-    col_mcc      = st.text_input("MCC",                 "mcc")
-    col_bin      = st.text_input("BIN",                 "bin")
-    col_tarjeta  = st.text_input("Tarjeta (token/4dig)","tarjeta")
-    col_canal    = st.text_input("Canal",               "canal")
-    col_entry    = st.text_input("Entry Mode",          "entry_mode")
-    col_ind      = st.text_input("Indicador fraude",    "indicador_fraude")
-    col_cod      = st.text_input("Código respuesta",    "codigo_respuesta")
+    # ── MAPEO DE COLUMNAS ─────────────────────────────────────────────
+    st.markdown("### 🗂️ Mapeo de Columnas")
+    st.caption("Escribe el nombre exacto de cada columna en tu archivo. "
+               "Si usas pyjanitor, los nombres ya estarán limpios (minúsculas, sin espacios).")
+
+    col_fecha    = st.text_input("Fecha transacción",   "fecha_transaccion")
+    col_monto    = st.text_input("Monto",                "monto")
+    col_comercio = st.text_input("Comercio",             "comercio")
+    col_mcc      = st.text_input("MCC",                  "mcc")
+    col_bin      = st.text_input("BIN",                  "bin")
+    col_tarjeta  = st.text_input("Tarjeta (token/4dig)", "tarjeta")
+    col_canal    = st.text_input("Canal",                "canal")
+    col_entry    = st.text_input("Entry Mode",           "entry_mode")
+    col_ind      = st.text_input("Indicador fraude",     "indicador_fraude")
+    col_cod      = st.text_input("Código respuesta",     "codigo_respuesta")
 
     st.markdown("---")
     st.markdown("### 🎛️ Parámetros del Modelo")
@@ -105,7 +160,8 @@ with st.sidebar:
     tree_depth      = st.slider("Profundidad árbol destilado", 2, 7, 4)
 
     st.markdown("---")
-    st.caption("🛡️ Scotiabank Peru — Fraud Prevention\nv1.0 — Analista: Myke")
+    st.caption(f"🛡️ Scotiabank Peru — Fraud Prevention\nv1.1 — Analista: Myke\n"
+               f"{'✅ pyjanitor activo' if HAS_JANITOR else '⚠️ pyjanitor no instalado'}")
 
 # ══════════════════════════════════════════════════════════════════════
 # DATOS
@@ -187,11 +243,44 @@ def generate_synthetic(n=6000, seed=42):
     return df
 
 
-def load_uploaded(file):
+def clean_col_names(df):
+    """
+    Limpia nombres de columnas con pyjanitor si está disponible,
+    sino hace limpieza manual equivalente.
+    Resultado: minúsculas, sin espacios (→ _), sin paréntesis ni caracteres especiales.
+    Ejemplo: 'Authorization Timestamp (America/Bogota)' → 'authorization_timestamp_america_bogota'
+    """
+    if HAS_JANITOR:
+        import janitor
+        return df.clean_names()
+    else:
+        df.columns = (df.columns
+                      .str.strip()
+                      .str.lower()
+                      .str.replace(r"[^\w\s]", "", regex=True)
+                      .str.replace(r"\s+", "_", regex=True)
+                      .str.replace(r"_+", "_", regex=True)
+                      .str.strip("_"))
+        return df
+
+
+def load_file(path_or_buffer, skip_rows=4, apply_janitor=True, is_path=True):
+    """
+    Carga Excel o CSV desde ruta de disco o buffer de Streamlit.
+      - skip_rows: filas a saltarse (tu Monitor tiene 4)
+      - apply_janitor: limpia nombres de columnas
+    """
     try:
-        if file.name.endswith((".xlsx",".xls")):
-            return pd.read_excel(file)
-        return pd.read_csv(file, encoding="latin-1")
+        name = path_or_buffer if is_path else getattr(path_or_buffer, "name", "")
+        if str(name).lower().endswith((".xlsx", ".xls")):
+            df = pd.read_excel(path_or_buffer, skiprows=skip_rows, engine="openpyxl")
+        else:
+            df = pd.read_csv(path_or_buffer, skiprows=skip_rows, encoding="latin-1")
+
+        if apply_janitor:
+            df = clean_col_names(df)
+
+        return df
     except Exception as e:
         st.error(f"Error al cargar archivo: {e}")
         return None
@@ -391,14 +480,46 @@ def train_models(df, tree_depth):
 # CARGA DE DATOS
 # ══════════════════════════════════════════════════════════════════════
 
-if use_synthetic or uploaded_file is None:
+# ══════════════════════════════════════════════════════════════════════
+# CARGA DE DATOS
+# ══════════════════════════════════════════════════════════════════════
+
+if use_synthetic:
     df_raw = generate_synthetic()
     data_source = "🧪 Datos sintéticos (demo)"
-else:
-    df_raw = load_uploaded(uploaded_file)
+
+elif selected_file:
+    df_raw = load_file(selected_file, skip_rows=skip_rows,
+                       apply_janitor=use_janitor, is_path=True)
+    data_source = f"📂 {os.path.basename(selected_file)}"
     if df_raw is None:
         st.stop()
-    data_source = f"📂 {uploaded_file.name}"
+
+elif uploaded_file:
+    df_raw = load_file(uploaded_file, skip_rows=skip_rows,
+                       apply_janitor=use_janitor, is_path=False)
+    data_source = f"⬆️ {uploaded_file.name}"
+    if df_raw is None:
+        st.stop()
+
+else:
+    st.warning("Selecciona una fuente de datos en el sidebar.")
+    st.stop()
+
+# ── VISOR DE COLUMNAS ─────────────────────────────────────────────────
+# Muestra todas las columnas disponibles para que puedas copiar
+# los nombres exactos al mapeo del sidebar
+if not use_synthetic:
+    with st.expander("🔍 Ver columnas disponibles en tu archivo", expanded=True):
+        cols_df = pd.DataFrame({
+            "Columna": df_raw.columns.tolist(),
+            "Tipo": [str(df_raw[c].dtype) for c in df_raw.columns],
+            "Ejemplo": [str(df_raw[c].iloc[0]) if len(df_raw) > 0 else "" for c in df_raw.columns],
+            "Nulos (%)": [f"{df_raw[c].isna().mean()*100:.1f}%" for c in df_raw.columns],
+        })
+        st.dataframe(cols_df, use_container_width=True, hide_index=True)
+        st.caption("💡 Copia el nombre exacto de la columna (columna 'Columna' arriba) "
+                   "y pégalo en el Mapeo de Columnas del sidebar.")
 
 df = preprocess(df_raw, col_fecha, col_monto, col_ind)
 df = feature_engineering(df, col_comercio, col_bin, col_monto, col_cod,
@@ -884,106 +1005,3 @@ with tab4:
                                ].to_csv(index=False).encode("utf-8"),
                        file_name="transacciones_con_score.csv",
                        mime="text/csv")
-
-
-
-----   README
-# 🛡️ Fraud Analyzer — Scotiabank Peru
-
-App Streamlit para análisis de fraude transaccional por comercio,
-detección de Punto de Compromiso (POC), modelado y generación de reglas.
-
-## Instalación
-
-```bash
-pip install -r requirements.txt
-```
-
-## Cómo correr
-
-```bash
-streamlit run app.py
-```
-
-Abre automáticamente en: http://localhost:8501
-
----
-
-## Flujo de uso
-
-1. **Sidebar → Datos**
-   - Activa "Usar datos sintéticos" para demo inmediato
-   - O sube un CSV/Excel exportado del Monitor
-
-2. **Sidebar → Mapeo de columnas**
-   - Ajusta los nombres de columna según tu export
-   - Columnas clave: fecha, monto, comercio, bin, indicador_fraude, codigo_respuesta
-
-3. **Sidebar → Parámetros**
-   - Ajusta umbrales de fraud rate, scores y ventana velocity
-
----
-
-## Secciones
-
-### 🏪 Comercios
-- Ranking por score de riesgo compuesto (fraud rate + EFL + severidad)
-- Scatter fraud rate vs EFL con detección de POC
-- Evolución mensual por comercio seleccionado
-
-### 💳 BINs & POC
-- Detección automática de Punto de Compromiso
-- Scatter tarjetas afectadas vs fraud rate
-- Top BINs con velocity bursts
-
-### 🤖 Modelo & Score
-- Teacher model (LightGBM/RandomForest) + Regresión Logística
-- Curva ROC comparativa
-- Distribución de scores por clase
-- **Fórmula lista para implementar en el motor**
-- Árbol destilado (reglas if/then)
-
-### ⚙️ Reglas Candidatas
-- Generación automática de reglas por tipo:
-  - FRAUD_RATE: comercios sobre umbral
-  - PUNTO_COMPROMISO: BINs comprometidos
-  - VELOCITY: ráfagas por BIN
-  - N7_ELEVADO: riesgo CNP
-  - SCORE_MODELO: umbral de probabilidad
-- Exportar reglas como CSV
-- Exportar transacciones con score
-
----
-
-## Lógica de etiquetado (target)
-
-| Indicador | Significado | Uso en modelo |
-|-----------|------------|---------------|
-| F | Fraude confirmado | ✅ Positivo (train) |
-| G | Buena confirmada | ✅ Negativo (train) |
-| D | Descarte analista | ⚠️ Negativo peso 0.5 |
-| N | Sin revisar | 🔲 Solo inferencia |
-| P | Pendiente | ❌ Excluido |
-
-## Códigos de respuesta críticos
-
-| Código | Significado | Uso |
-|--------|------------|-----|
-| N7 | CVV2 no coincide | Feature fuerte CNP fraud |
-| 04 | Tarjeta robada | Feature crítica |
-| 14 | Tarjeta inválida | Posible BIN testing |
-| 51 | Sin fondos | Feature comportamiento |
-| 59/53/69 | Regla interna | Ya en radar del motor |
-| 00 | Aprobada | Baseline |
-
-
---- REQUERIMIENTOS
-
-streamlit>=1.32.0
-pandas>=2.0.0
-numpy>=1.24.0
-plotly>=5.18.0
-scikit-learn>=1.3.0
-lightgbm>=4.0.0
-openpyxl>=3.1.0
-
