@@ -1,0 +1,989 @@
+"""
+╔══════════════════════════════════════════════════════════════════════╗
+║  FRAUD ANALYZER — Scotiabank Peru                                    ║
+║  Streamlit App — Análisis de Comercios, Modelos y Reglas Candidatas  ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+CÓMO CORRER:
+    streamlit run app.py
+
+CÓMO USAR:
+    - Sube un CSV/Excel exportado del Monitor (o usa datos sintéticos)
+    - Configura las columnas en el sidebar
+    - Explora las 4 secciones: Comercios / BINs+POC / Modelo / Reglas
+"""
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from datetime import datetime, timedelta
+import warnings
+warnings.filterwarnings("ignore")
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier, export_text
+from sklearn.ensemble import RandomForestClassifier, IsolationForest
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (roc_auc_score, classification_report,
+                              precision_recall_curve, roc_curve,
+                              confusion_matrix)
+try:
+    import lightgbm as lgb
+    HAS_LGB = True
+except ImportError:
+    HAS_LGB = False
+
+# ══════════════════════════════════════════════════════════════════════
+# CONFIGURACIÓN DE PÁGINA
+# ══════════════════════════════════════════════════════════════════════
+
+st.set_page_config(
+    page_title="Fraud Analyzer — Scotiabank Peru",
+    page_icon="🛡️",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+st.markdown("""
+<style>
+    .main { background-color: #0e1117; }
+    .metric-box {
+        background: #1a2035; border: 1px solid #2d3f5e;
+        border-radius: 10px; padding: 16px 20px; text-align: center;
+    }
+    .metric-box .value { font-size: 28px; font-weight: 700; }
+    .metric-box .label { font-size: 12px; color: #8ba4c0;
+                         text-transform: uppercase; letter-spacing: 1px; }
+    .rule-card {
+        background: #1a1a2e; border-left: 4px solid;
+        border-radius: 6px; padding: 12px 16px; margin-bottom: 8px;
+    }
+    .stTabs [data-baseweb="tab"] { font-size: 14px; font-weight: 500; }
+    code { font-size: 13px; }
+</style>
+""", unsafe_allow_html=True)
+
+# ══════════════════════════════════════════════════════════════════════
+# SIDEBAR — CONFIGURACIÓN
+# ══════════════════════════════════════════════════════════════════════
+
+with st.sidebar:
+    st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/7/7b/Scotiabank.svg/320px-Scotiabank.svg.png", width=160)
+    st.markdown("## ⚙️ Configuración")
+
+    st.markdown("### 📁 Datos")
+    use_synthetic = st.checkbox("Usar datos sintéticos (demo)", value=True)
+    uploaded_file = None
+    if not use_synthetic:
+        uploaded_file = st.file_uploader("Export del Monitor (CSV/Excel)", type=["csv","xlsx","xls"])
+
+    st.markdown("---")
+    st.markdown("### 🗂️ Mapeo de Columnas")
+    st.caption("Ajusta si tus columnas tienen nombres distintos")
+
+    col_fecha    = st.text_input("Fecha transacción",  "fecha_transaccion")
+    col_monto    = st.text_input("Monto",               "monto")
+    col_comercio = st.text_input("Comercio",            "comercio")
+    col_mcc      = st.text_input("MCC",                 "mcc")
+    col_bin      = st.text_input("BIN",                 "bin")
+    col_tarjeta  = st.text_input("Tarjeta (token/4dig)","tarjeta")
+    col_canal    = st.text_input("Canal",               "canal")
+    col_entry    = st.text_input("Entry Mode",          "entry_mode")
+    col_ind      = st.text_input("Indicador fraude",    "indicador_fraude")
+    col_cod      = st.text_input("Código respuesta",    "codigo_respuesta")
+
+    st.markdown("---")
+    st.markdown("### 🎛️ Parámetros del Modelo")
+    fraud_rate_thr  = st.slider("Umbral fraud rate (reglas)", 0.05, 0.50, 0.15, 0.01)
+    score_alto      = st.slider("Score → ALERTA ALTA",        0.50, 0.95, 0.65, 0.05)
+    score_medio     = st.slider("Score → REVISIÓN MANUAL",    0.20, 0.60, 0.40, 0.05)
+    vel_window      = st.number_input("Ventana velocity (seg)", 10, 300, 60, 10)
+    tree_depth      = st.slider("Profundidad árbol destilado", 2, 7, 4)
+
+    st.markdown("---")
+    st.caption("🛡️ Scotiabank Peru — Fraud Prevention\nv1.0 — Analista: Myke")
+
+# ══════════════════════════════════════════════════════════════════════
+# DATOS
+# ══════════════════════════════════════════════════════════════════════
+
+@st.cache_data
+def generate_synthetic(n=6000, seed=42):
+    np.random.seed(seed)
+    rng = np.random.default_rng(seed)
+
+    comercios = ["AMAZON","MERCADO_LIBRE","RAPPI","UBER","NETFLIX",
+                 "FALABELLA","SAGA","WONG","PLAZAVEA","COMERCIO_X",
+                 "GOOGLE_PLAY","ALIEXPRESS"]
+    mccs      = ["5411","5812","7372","4816","5999","6011","7011","5945"]
+    canales   = ["E-COMMERCE","POS","ATM","CONTACTLESS"]
+    entries   = ["01","02","05","07","10","81","91"]
+
+    # Códigos de respuesta con semántica real
+    # 00=aprobada, N7=CVV fail, 04=robada, 14=inválida,
+    # 51=sin fondos, 59/53/69=regla interna
+    cod_resp  = ["00","N7","04","14","51","59","53","69","05","12"]
+    cod_probs = [0.50,0.10,0.04,0.04,0.08,0.06,0.04,0.04,0.05,0.05]
+
+    bins_normales     = [f"4{rng.integers(10000,99999)}" for _ in range(20)]
+    bins_comprometidos= ["422052","423011","430150"]
+    all_bins          = bins_normales + bins_comprometidos
+
+    base = datetime(2024,10,1)
+    fechas = [base + timedelta(seconds=int(x))
+              for x in rng.integers(0,86400*90,n)]
+
+    comercio_arr = rng.choice(comercios, n)
+    bin_arr = []
+    for c in comercio_arr:
+        if c in ["COMERCIO_X","RAPPI","ALIEXPRESS"]:
+            w = [0.05]*20 + [0.30,0.25,0.20]
+            w = np.array(w); w /= w.sum()
+        else:
+            w = [1/23]*23
+        bin_arr.append(rng.choice(all_bins, p=w))
+
+    montos = np.where(
+        np.isin(bin_arr, bins_comprometidos),
+        rng.lognormal(4.6,1.3,n),
+        rng.lognormal(4.0,0.8,n)
+    ).round(2)
+
+    # Probabilidad de fraude contextualizada
+    p = np.where(np.isin(bin_arr,["422052"]), 0.38,
+        np.where(np.isin(bin_arr,["423011"]), 0.28,
+        np.where(np.isin(bin_arr,["430150"]), 0.20,
+        np.where(np.isin(comercio_arr,["COMERCIO_X"]), 0.22,
+        np.where(np.isin(comercio_arr,["RAPPI","ALIEXPRESS"]), 0.16,
+        np.where(np.isin(comercio_arr,["AMAZON","GOOGLE_PLAY"]), 0.05, 0.03))))))
+
+    p = np.clip(p + (montos > 500)*0.08, 0, 0.92)
+
+    # Indicador con lógica real:
+    # F=fraude confirmado, G=buena confirmada, D=descarte, N=sin revisar, P=pendiente
+    rand = rng.uniform(0,1,n)
+    indicador = np.where(rand < p, "F",
+                np.where(rand < p + 0.12, "G",
+                np.where(rand < p + 0.17, "D",
+                np.where(rand < p + 0.20, "P", "N"))))
+
+    df = pd.DataFrame({
+        "fecha_transaccion": fechas,
+        "monto":             montos,
+        "comercio":          comercio_arr,
+        "mcc":               rng.choice(mccs, n),
+        "bin":               bin_arr,
+        "tarjeta":           [f"{rng.integers(1000,9999)}" for _ in range(n)],
+        "canal":             rng.choice(canales, n, p=[0.42,0.33,0.15,0.10]),
+        "entry_mode":        rng.choice(entries, n),
+        "indicador_fraude":  indicador,
+        "codigo_respuesta":  rng.choice(cod_resp, n, p=cod_probs),
+        "id_cliente":        [f"CLI{rng.integers(10000,99999)}" for _ in range(n)],
+    })
+    return df
+
+
+def load_uploaded(file):
+    try:
+        if file.name.endswith((".xlsx",".xls")):
+            return pd.read_excel(file)
+        return pd.read_csv(file, encoding="latin-1")
+    except Exception as e:
+        st.error(f"Error al cargar archivo: {e}")
+        return None
+
+
+@st.cache_data
+def preprocess(df, col_fecha, col_monto, col_ind):
+    df = df.copy()
+    df[col_fecha]  = pd.to_datetime(df[col_fecha], errors="coerce")
+    df[col_monto]  = pd.to_numeric(df[col_monto], errors="coerce").fillna(0)
+
+    # ── TARGET: etiquetado con niveles de confianza ──────────────────
+    # Solo F y G → entrenamiento limpio (PU Learning approach)
+    # N → unlabeled (no es negativo confirmado)
+    # D → negativo probable (peso 0.5)
+    # P → excluir del entrenamiento
+    df["label_tipo"] = df[col_ind].map({
+        "F": "positivo_confirmado",
+        "G": "negativo_confirmado",
+        "D": "negativo_probable",
+        "N": "unlabeled",
+        "P": "excluir"
+    }).fillna("unlabeled")
+
+    df["fraude_bin"] = (df[col_ind] == "F").astype(int)
+    df["fraude_conocido"] = df[col_ind].isin(["F","G"]).astype(int)
+
+    df = df.sort_values(col_fecha).reset_index(drop=True)
+    return df
+
+
+@st.cache_data
+def feature_engineering(df, col_comercio, col_bin, col_monto, col_cod,
+                         col_canal, col_entry, col_mcc, col_tarjeta,
+                         col_fecha, vel_window, fraud_rate_thr):
+    df = df.copy()
+
+    # ── Códigos de respuesta críticos ───────────────────────────────
+    # N7=CVV, 04=robada, 14=inválida, 51=sin fondos, 59/53/69=regla interna
+    df["es_n7"]            = (df[col_cod] == "N7").astype(int)
+    df["es_robada"]        = (df[col_cod] == "04").astype(int)
+    df["es_invalida"]      = (df[col_cod] == "14").astype(int)
+    df["es_regla_interna"] = df[col_cod].isin(["59","53","69"]).astype(int)
+    df["fue_aprobada"]     = (df[col_cod] == "00").astype(int)
+    df["es_critico"]       = df[col_cod].isin(["N7","04","14"]).astype(int)
+
+    # ── Stats por comercio (sobre F y G solamente — etiquetas limpias)
+    limpios = df[df["label_tipo"].isin(["positivo_confirmado","negativo_confirmado"])]
+    cs = (limpios.groupby(col_comercio)
+          .agg(txn_clean=("fraude_bin","count"),
+               fraudes=("fraude_bin","sum"))
+          .assign(fraud_rate_clean=lambda x: x["fraudes"]/x["txn_clean"])
+          .fillna(0))
+    df = df.merge(cs[["fraud_rate_clean"]], on=col_comercio, how="left")
+
+    # Stats sobre todo el universo (para features contextuales)
+    cs_all = (df.groupby(col_comercio)
+              .agg(txn_total=("fraude_bin","count"),
+                   monto_medio=(col_monto,"mean"),
+                   monto_std=(col_monto,"std"),
+                   ratio_n7=("es_n7","mean"),
+                   ratio_critico=("es_critico","mean"),
+                   ratio_regla=("es_regla_interna","mean"))
+              .fillna(0))
+    df = df.merge(cs_all, on=col_comercio, how="left")
+
+    # ── Z-score monto por comercio ──────────────────────────────────
+    def zscore(g):
+        mu, sigma = g[col_monto].mean(), g[col_monto].std()
+        return ((g[col_monto]-mu)/(sigma+1e-6)).fillna(0)
+    df["zscore_monto"] = df.groupby(col_comercio, group_keys=False).apply(zscore)
+
+    # ── Velocity por BIN ────────────────────────────────────────────
+    df = df.sort_values([col_bin, col_fecha])
+    def vel_flag(g):
+        ts = g[col_fecha].astype(np.int64)//1e9
+        flags = []
+        for t in ts:
+            burst = ((ts >= t-vel_window) & (ts <= t+vel_window)).sum()
+            flags.append(1 if burst >= 3 else 0)
+        return pd.Series(flags, index=g.index)
+    df["velocity_flag"] = df.groupby(col_bin, group_keys=False).apply(vel_flag)
+
+    # ── BIN stats — POC ─────────────────────────────────────────────
+    bin_limpios = limpios[limpios["label_tipo"]=="positivo_confirmado"]
+    bs = (df.groupby(col_bin)
+          .agg(bin_txn=("fraude_bin","count"),
+               bin_tarjetas=(col_tarjeta,"nunique"))
+          .join(bin_limpios.groupby(col_bin)["fraude_bin"]
+                .agg(bin_fraudes="sum"), how="left")
+          .fillna(0)
+          .assign(bin_fraud_rate=lambda x: x["bin_fraudes"]/x["bin_txn"].replace(0,np.nan))
+          .fillna(0))
+    bs["poc_flag"] = (
+        (bs["bin_fraud_rate"] > fraud_rate_thr) &
+        (bs["bin_tarjetas"] >= 3)
+    ).astype(int)
+    df = df.merge(bs[["bin_fraud_rate","bin_tarjetas","poc_flag"]], on=col_bin, how="left")
+
+    # ── Encodings ───────────────────────────────────────────────────
+    for col in [col_canal, col_entry, col_mcc]:
+        le = LabelEncoder()
+        df[f"{col}_enc"] = le.fit_transform(df[col].astype(str))
+
+    return df
+
+
+FEATURES = ["monto","fraud_rate_clean","monto_medio","zscore_monto",
+            "ratio_n7","ratio_critico","ratio_regla","velocity_flag",
+            "bin_fraud_rate","poc_flag","es_n7","es_robada",
+            "es_invalida","es_regla_interna","fue_aprobada",
+            "canal_enc","entry_mode_enc","mcc_enc"]
+
+
+@st.cache_data
+def train_models(df, tree_depth):
+    # Dataset limpio: solo F y G
+    df_clean = df[df["label_tipo"].isin(["positivo_confirmado","negativo_confirmado"])].copy()
+    df_clean["target"] = (df_clean["label_tipo"]=="positivo_confirmado").astype(int)
+
+    # Incluir D con peso 0.5
+    df_d = df[df["label_tipo"]=="negativo_probable"].copy()
+    df_d["target"] = 0
+
+    df_train_all = pd.concat([df_clean, df_d], ignore_index=True)
+    sample_weights = np.where(df_train_all["label_tipo"]=="negativo_probable", 0.5, 1.0)
+
+    feats_avail = [f for f in FEATURES if f in df_train_all.columns]
+    X = df_train_all[feats_avail].fillna(0)
+    y = df_train_all["target"]
+
+    X_tr, X_te, y_tr, y_te, sw_tr, _ = train_test_split(
+        X, y, sample_weights, test_size=0.25,
+        stratify=y, random_state=42
+    )
+
+    # ── Teacher: LightGBM o RandomForest ────────────────────────────
+    if HAS_LGB:
+        teacher = lgb.LGBMClassifier(n_estimators=200, learning_rate=0.05,
+                                      num_leaves=31, class_weight="balanced",
+                                      random_state=42, verbose=-1)
+    else:
+        teacher = RandomForestClassifier(n_estimators=200, class_weight="balanced",
+                                          random_state=42, n_jobs=-1)
+    teacher.fit(X_tr, y_tr, sample_weight=sw_tr)
+    teacher_proba_test = teacher.predict_proba(X_te)[:,1]
+    teacher_auc = roc_auc_score(y_te, teacher_proba_test)
+
+    # Score en todo el dataset
+    X_all = df[feats_avail].fillna(0)
+    df["prob_fraude"] = teacher.predict_proba(X_all)[:,1]
+
+    # ── Regresión Logística (implementable en motor) ─────────────────
+    scaler = StandardScaler()
+    X_tr_sc = scaler.fit_transform(X_tr)
+    X_te_sc = scaler.transform(X_te)
+    X_all_sc= scaler.transform(X_all)
+
+    lr = LogisticRegression(class_weight="balanced", max_iter=500, random_state=42)
+    lr.fit(X_tr_sc, y_tr, sample_weight=sw_tr)
+    lr_proba_test = lr.predict_proba(X_te_sc)[:,1]
+    lr_auc = roc_auc_score(y_te, lr_proba_test)
+    df["prob_fraude_lr"] = lr.predict_proba(X_all_sc)[:,1]
+
+    # ── Student: árbol destilado del teacher ─────────────────────────
+    soft_labels = (df.loc[df_train_all.index, "prob_fraude"] > 0.40).astype(int)
+    student = DecisionTreeClassifier(max_depth=tree_depth,
+                                      class_weight="balanced", random_state=42)
+    student.fit(X_tr, soft_labels[X_tr.index] if hasattr(soft_labels,"iloc") else
+                soft_labels[:len(X_tr)])
+    student_proba = student.predict_proba(X_te)[:,1]
+    student_auc = roc_auc_score(y_te, student_proba)
+
+    # Coeficientes LR → fórmula para el motor
+    coef_df = pd.DataFrame({
+        "variable": feats_avail,
+        "coeficiente": lr.coef_[0]
+    }).sort_values("coeficiente", key=abs, ascending=False)
+
+    tree_rules = export_text(student, feature_names=feats_avail)
+
+    metrics = {
+        "teacher_auc": teacher_auc,
+        "lr_auc": lr_auc,
+        "student_auc": student_auc,
+        "teacher_name": "LightGBM" if HAS_LGB else "RandomForest",
+        "y_te": y_te,
+        "teacher_proba_test": teacher_proba_test,
+        "lr_proba_test": lr_proba_test,
+        "feats_avail": feats_avail,
+        "intercept": lr.intercept_[0],
+    }
+    return df, coef_df, tree_rules, metrics
+
+
+# ══════════════════════════════════════════════════════════════════════
+# CARGA DE DATOS
+# ══════════════════════════════════════════════════════════════════════
+
+if use_synthetic or uploaded_file is None:
+    df_raw = generate_synthetic()
+    data_source = "🧪 Datos sintéticos (demo)"
+else:
+    df_raw = load_uploaded(uploaded_file)
+    if df_raw is None:
+        st.stop()
+    data_source = f"📂 {uploaded_file.name}"
+
+df = preprocess(df_raw, col_fecha, col_monto, col_ind)
+df = feature_engineering(df, col_comercio, col_bin, col_monto, col_cod,
+                          col_canal, col_entry, col_mcc, col_tarjeta,
+                          col_fecha, vel_window, fraud_rate_thr)
+df, coef_df, tree_rules, metrics = train_models(df, tree_depth)
+
+# ══════════════════════════════════════════════════════════════════════
+# HEADER
+# ══════════════════════════════════════════════════════════════════════
+
+st.markdown("## 🛡️ Fraud Analyzer — Scotiabank Peru")
+st.caption(f"Fuente: {data_source} &nbsp;|&nbsp; {len(df):,} transacciones &nbsp;|&nbsp; Periodo: "
+           f"{df[col_fecha].min().date()} → {df[col_fecha].max().date()}")
+
+# KPIs globales
+total_txn   = len(df)
+total_f     = (df[col_ind]=="F").sum()
+fraud_rate  = total_f / total_txn
+total_g     = (df[col_ind]=="G").sum()
+total_n     = (df[col_ind]=="N").sum()
+total_p     = (df[col_ind]=="P").sum()
+efl_total   = (df["prob_fraude"] * df[col_monto]).sum()
+poc_bins    = (df["poc_flag"]==1)[col_bin].nunique() if "poc_flag" in df.columns else 0
+poc_bins    = df[df["poc_flag"]==1][col_bin].nunique()
+
+c1,c2,c3,c4,c5,c6 = st.columns(6)
+def kpi(col, val, label, color="#00d4ff"):
+    col.markdown(f"""<div class="metric-box">
+        <div class="value" style="color:{color}">{val}</div>
+        <div class="label">{label}</div></div>""", unsafe_allow_html=True)
+
+kpi(c1, f"{total_txn:,}",      "Transacciones")
+kpi(c2, f"{total_f:,}",        "Fraudes (F)",    "#ff3b5c")
+kpi(c3, f"{fraud_rate:.1%}",   "Fraud Rate",     "#ff3b5c")
+kpi(c4, f"${efl_total:,.0f}",  "EFL Total",      "#ffad30")
+kpi(c5, f"{poc_bins}",         "BINs POC",       "#ff3b5c")
+kpi(c6, f"{total_n:,}",        "Sin calificar (N)", "#8ba4c0")
+
+st.markdown("<br>", unsafe_allow_html=True)
+
+# Desglose indicador
+with st.expander("📊 Distribución del Indicador de Fraude"):
+    ind_counts = df[col_ind].value_counts().reset_index()
+    ind_counts.columns = ["Indicador","Cantidad"]
+    ind_counts["Significado"] = ind_counts["Indicador"].map({
+        "F":"Fraude confirmado",
+        "G":"Buena confirmada (cliente verificó)",
+        "D":"Descarte analista",
+        "N":"Sin revisar (unlabeled)",
+        "P":"Pendiente — excluir del modelo"
+    })
+    ind_counts["Uso en modelo"] = ind_counts["Indicador"].map({
+        "F":"✅ Positivo confirmado",
+        "G":"✅ Negativo confirmado",
+        "D":"⚠️ Negativo probable (peso 0.5)",
+        "N":"🔲 Unlabeled — solo inferencia",
+        "P":"❌ Excluido"
+    })
+    st.dataframe(ind_counts, use_container_width=True, hide_index=True)
+    st.caption("Solo F y G se usan como etiquetas limpias para entrenar. "
+               "N no es negativo confirmado — puede contener fraudes no detectados.")
+
+st.markdown("---")
+
+# ══════════════════════════════════════════════════════════════════════
+# TABS PRINCIPALES
+# ══════════════════════════════════════════════════════════════════════
+
+tab1, tab2, tab3, tab4 = st.tabs([
+    "🏪 Comercios",
+    "💳 BINs & POC",
+    "🤖 Modelo & Score",
+    "⚙️ Reglas Candidatas"
+])
+
+# ──────────────────────────────────────────────────────────────────────
+# TAB 1: COMERCIOS
+# ──────────────────────────────────────────────────────────────────────
+
+with tab1:
+    st.markdown("### Ranking de Comercios por Riesgo")
+
+    ranking = (df.groupby(col_comercio).agg(
+        txn_total   =(col_ind,"count"),
+        fraudes     =("fraude_bin","sum"),
+        monto_total =(col_monto,"sum"),
+        monto_medio =(col_monto,"mean"),
+        poc_activo  =("poc_flag","max"),
+        vel_eventos =("velocity_flag","sum"),
+        ratio_n7    =("ratio_n7","first"),
+        ratio_crit  =("ratio_critico","first"),
+        efl_medio   =("prob_fraude","mean"),
+        fr_clean    =("fraud_rate_clean","first"),
+    ).assign(
+        fraud_rate = lambda x: x["fraudes"]/x["txn_total"],
+        severidad  = lambda x: np.where(x["fraudes"]>0, x["monto_total"]/x["fraudes"],0),
+        efl        = lambda x: x["efl_medio"] * x["monto_medio"],
+    ))
+
+    fr_max  = ranking["fraud_rate"].max()
+    efl_max = ranking["efl"].max()
+    sev_max = ranking["severidad"].max()
+    ranking["score_riesgo"] = (
+        0.40*(ranking["fraud_rate"]/fr_max) +
+        0.35*(ranking["efl"]/efl_max) +
+        0.25*(ranking["severidad"]/sev_max)
+    ).round(4)
+    ranking = ranking.sort_values("score_riesgo", ascending=False)
+
+    col_l, col_r = st.columns([1.2,1])
+
+    with col_l:
+        top_n = st.slider("Top N comercios", 5, len(ranking), 10)
+        top = ranking.head(top_n).reset_index()
+
+        fig = px.bar(top, x="score_riesgo", y=col_comercio,
+                     orientation="h", color="fraud_rate",
+                     color_continuous_scale=["#00e5a0","#ffad30","#ff3b5c"],
+                     labels={"score_riesgo":"Score de Riesgo",
+                             col_comercio:"Comercio","fraud_rate":"Fraud Rate"},
+                     title="Score de Riesgo Compuesto")
+        fig.update_layout(height=400, plot_bgcolor="#0e1117",
+                          paper_bgcolor="#0e1117", font_color="#e8eef7",
+                          yaxis=dict(autorange="reversed"),
+                          coloraxis_colorbar=dict(tickformat=".0%"))
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col_r:
+        fig2 = px.scatter(top, x="fraud_rate", y="efl", size="txn_total",
+                          color="poc_activo", color_discrete_map={0:"#00d4ff",1:"#ff3b5c"},
+                          text=col_comercio,
+                          labels={"fraud_rate":"Fraud Rate","efl":"EFL ($)",
+                                  "poc_activo":"POC Activo"},
+                          title="Fraud Rate vs EFL")
+        fig2.update_traces(textposition="top center", textfont_size=9)
+        fig2.update_layout(height=400, plot_bgcolor="#0e1117",
+                           paper_bgcolor="#0e1117", font_color="#e8eef7")
+        fig2.update_xaxes(tickformat=".0%")
+        st.plotly_chart(fig2, use_container_width=True)
+
+    # Tabla detallada
+    display_cols = ["fraud_rate","efl","severidad","txn_total",
+                    "fraudes","poc_activo","vel_eventos","ratio_n7","score_riesgo"]
+    display_df = ranking[display_cols].head(top_n).copy()
+    display_df["fraud_rate"] = display_df["fraud_rate"].map("{:.1%}".format)
+    display_df["ratio_n7"]   = display_df["ratio_n7"].map("{:.1%}".format)
+    display_df["efl"]        = display_df["efl"].map("${:.1f}".format)
+    display_df["severidad"]  = display_df["severidad"].map("${:.0f}".format)
+    display_df["score_riesgo"]= display_df["score_riesgo"].map("{:.3f}".format)
+    st.dataframe(display_df, use_container_width=True)
+
+    # Serie temporal de fraudes por comercio
+    st.markdown("### Evolución mensual de fraudes")
+    sel_comercios = st.multiselect("Selecciona comercios",
+        ranking.index.tolist(), default=ranking.index[:3].tolist())
+
+    if sel_comercios:
+        df_sel = df[df[col_comercio].isin(sel_comercios)].copy()
+        df_sel["mes"] = df_sel[col_fecha].dt.to_period("M").astype(str)
+        trend = (df_sel.groupby([col_comercio,"mes"])
+                 .agg(fraudes=("fraude_bin","sum"), txn=("fraude_bin","count"))
+                 .assign(fraud_rate=lambda x: x["fraudes"]/x["txn"])
+                 .reset_index())
+        fig3 = px.line(trend, x="mes", y="fraud_rate", color=col_comercio,
+                       markers=True, title="Fraud Rate mensual por comercio")
+        fig3.update_layout(plot_bgcolor="#0e1117", paper_bgcolor="#0e1117",
+                           font_color="#e8eef7", yaxis_tickformat=".0%")
+        st.plotly_chart(fig3, use_container_width=True)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# TAB 2: BINs & POC
+# ──────────────────────────────────────────────────────────────────────
+
+with tab2:
+    st.markdown("### Análisis de BINs — Punto de Compromiso (POC)")
+    st.caption("POC = BIN con alta concentración de fraude Y múltiples tarjetas distintas afectadas. "
+               "Indica que hay un origen común de compromiso (robo masivo de datos).")
+
+    bin_stats = (df.groupby(col_bin).agg(
+        txn         =(col_ind,"count"),
+        fraudes     =("fraude_bin","sum"),
+        tarjetas    =(col_tarjeta,"nunique"),
+        bin_fr      =("bin_fraud_rate","first"),
+        poc         =("poc_flag","first"),
+        bursts      =("velocity_flag","sum"),
+        monto_medio =(col_monto,"mean"),
+        ratio_n7    =("ratio_n7","first"),
+    ).assign(fraud_rate=lambda x: x["fraudes"]/x["txn"])
+     .sort_values("fraud_rate", ascending=False))
+
+    poc_df  = bin_stats[bin_stats["poc"]==1]
+    norm_df = bin_stats[bin_stats["poc"]==0]
+
+    c1,c2,c3 = st.columns(3)
+    kpi(c1, len(poc_df), "BINs con POC activo", "#ff3b5c")
+    kpi(c2, int(poc_df["tarjetas"].sum()) if len(poc_df)>0 else 0,
+        "Tarjetas comprometidas", "#ffad30")
+    kpi(c3, int(poc_df["bursts"].sum()) if len(poc_df)>0 else 0,
+        "Eventos velocity en POC", "#ff3b5c")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    fig_poc = px.scatter(bin_stats.reset_index(), x="tarjetas", y="fraud_rate",
+                         size="txn", color="poc",
+                         color_discrete_map={0:"#00d4ff", 1:"#ff3b5c"},
+                         hover_data=[col_bin,"fraudes","bursts"],
+                         text=col_bin,
+                         labels={"tarjetas":"Tarjetas distintas afectadas",
+                                 "fraud_rate":"Fraud Rate","poc":"POC"},
+                         title="Tarjetas comprometidas vs Fraud Rate — Detección de POC")
+    fig_poc.update_traces(textposition="top center", textfont_size=8)
+    fig_poc.update_layout(height=420, plot_bgcolor="#0e1117",
+                          paper_bgcolor="#0e1117", font_color="#e8eef7",
+                          yaxis_tickformat=".0%")
+    fig_poc.add_vline(x=3, line_dash="dash", line_color="#ffad30",
+                      annotation_text="Min tarjetas POC")
+    fig_poc.add_hline(y=fraud_rate_thr, line_dash="dash", line_color="#ffad30",
+                      annotation_text=f"Umbral FR {fraud_rate_thr:.0%}")
+    st.plotly_chart(fig_poc, use_container_width=True)
+
+    # Velocity — distribución de ráfagas
+    st.markdown("### Velocity Check — ráfagas por BIN")
+    vel_df = (df[df["velocity_flag"]==1]
+              .groupby(col_bin)["velocity_flag"].sum()
+              .sort_values(ascending=False).head(15).reset_index())
+    vel_df.columns = [col_bin, "bursts"]
+
+    if len(vel_df) > 0:
+        fig_vel = px.bar(vel_df, x=col_bin, y="bursts",
+                         color="bursts",
+                         color_continuous_scale=["#ffad30","#ff3b5c"],
+                         title=f"Top 15 BINs por eventos velocity (<{vel_window}s)")
+        fig_vel.update_layout(plot_bgcolor="#0e1117", paper_bgcolor="#0e1117",
+                              font_color="#e8eef7", showlegend=False)
+        st.plotly_chart(fig_vel, use_container_width=True)
+
+    # Tabla BINs POC
+    if len(poc_df) > 0:
+        st.markdown("### Detalle BINs con POC activo")
+        poc_display = poc_df[["txn","fraudes","fraud_rate","tarjetas",
+                               "bursts","monto_medio","ratio_n7"]].copy()
+        poc_display["fraud_rate"] = poc_display["fraud_rate"].map("{:.1%}".format)
+        poc_display["ratio_n7"]   = poc_display["ratio_n7"].map("{:.1%}".format)
+        poc_display["monto_medio"]= poc_display["monto_medio"].map("${:.0f}".format)
+        st.dataframe(poc_display, use_container_width=True)
+    else:
+        st.info("No se detectaron BINs con POC activo con los umbrales actuales.")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# TAB 3: MODELO
+# ──────────────────────────────────────────────────────────────────────
+
+with tab3:
+    st.markdown("### Resultados del Modelo")
+
+    c1,c2,c3,c4 = st.columns(4)
+    kpi(c1, f"{metrics['teacher_auc']:.3f}",
+        f"AUC — {metrics['teacher_name']}", "#00e5a0")
+    kpi(c2, f"{metrics['lr_auc']:.3f}",
+        "AUC — Regresión Logística", "#00d4ff")
+    kpi(c3, f"{metrics['student_auc']:.3f}",
+        f"AUC — Árbol destilado (d={tree_depth})", "#ffad30")
+    kpi(c4, f"{df['prob_fraude'].median():.3f}",
+        "Prob fraude mediana", "#8ba4c0")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    col_l, col_r = st.columns(2)
+
+    with col_l:
+        # ROC Curve — LR vs Teacher
+        fpr_t, tpr_t, _ = roc_curve(metrics["y_te"], metrics["teacher_proba_test"])
+        fpr_l, tpr_l, _ = roc_curve(metrics["y_te"], metrics["lr_proba_test"])
+
+        fig_roc = go.Figure()
+        fig_roc.add_trace(go.Scatter(x=fpr_t, y=tpr_t, mode="lines",
+            name=f"{metrics['teacher_name']} (AUC={metrics['teacher_auc']:.3f})",
+            line=dict(color="#00e5a0", width=2)))
+        fig_roc.add_trace(go.Scatter(x=fpr_l, y=tpr_l, mode="lines",
+            name=f"Logistic Reg (AUC={metrics['lr_auc']:.3f})",
+            line=dict(color="#00d4ff", width=2, dash="dash")))
+        fig_roc.add_trace(go.Scatter(x=[0,1], y=[0,1], mode="lines",
+            line=dict(color="#4a6080", dash="dot"), showlegend=False))
+        fig_roc.update_layout(title="Curva ROC", height=380,
+            plot_bgcolor="#0e1117", paper_bgcolor="#0e1117",
+            font_color="#e8eef7",
+            xaxis_title="False Positive Rate", yaxis_title="True Positive Rate")
+        st.plotly_chart(fig_roc, use_container_width=True)
+
+    with col_r:
+        # Distribución de scores
+        fig_dist = go.Figure()
+        fig_dist.add_trace(go.Histogram(
+            x=df[df["fraude_bin"]==1]["prob_fraude"],
+            name="Fraude (F)", nbinsx=50,
+            marker_color="#ff3b5c", opacity=0.7))
+        fig_dist.add_trace(go.Histogram(
+            x=df[df["fraude_bin"]==0]["prob_fraude"],
+            name="No Fraude", nbinsx=50,
+            marker_color="#00d4ff", opacity=0.5))
+        fig_dist.add_vline(x=score_alto, line_dash="dash",
+                           line_color="#ffad30",
+                           annotation_text=f"Alerta alta ({score_alto})")
+        fig_dist.add_vline(x=score_medio, line_dash="dot",
+                           line_color="#8ba4c0",
+                           annotation_text=f"Revisión ({score_medio})")
+        fig_dist.update_layout(title="Distribución del Score por Clase",
+            barmode="overlay", height=380,
+            plot_bgcolor="#0e1117", paper_bgcolor="#0e1117",
+            font_color="#e8eef7", xaxis_title="prob_fraude",
+            yaxis_title="Frecuencia")
+        st.plotly_chart(fig_dist, use_container_width=True)
+
+    # Importancia variables / Coeficientes LR
+    st.markdown("### Coeficientes de la Regresión Logística")
+    st.caption("Estos son los pesos que se implementan en el motor. "
+               "Coeficiente positivo = aumenta prob de fraude. Negativo = la reduce.")
+
+    fig_coef = px.bar(coef_df.head(12), x="coeficiente", y="variable",
+                      orientation="h",
+                      color="coeficiente",
+                      color_continuous_scale=["#00e5a0","#ffffff","#ff3b5c"],
+                      color_continuous_midpoint=0,
+                      title="Importancia de variables (Reg. Logística)")
+    fig_coef.update_layout(height=380, plot_bgcolor="#0e1117",
+                            paper_bgcolor="#0e1117", font_color="#e8eef7",
+                            yaxis=dict(autorange="reversed"))
+    st.plotly_chart(fig_coef, use_container_width=True)
+
+    # Fórmula para el motor
+    st.markdown("### 📋 Fórmula para el Motor (implementación)")
+    st.caption("Copia esto y entregáselo al especialista del Monitor.")
+
+    formula_parts = []
+    for _, row in coef_df.iterrows():
+        sign = "+" if row["coeficiente"] > 0 else ""
+        formula_parts.append(f"    {sign}{row['coeficiente']:.4f} × {row['variable']}")
+
+    formula_str = "score = (\n"
+    formula_str += "\n".join(formula_parts[:10])
+    formula_str += f"\n    + {metrics['intercept']:.4f}  ← intercepto\n)\n\n"
+    formula_str += "prob_fraude = 1 / (1 + exp(-score))\n\n"
+    formula_str += f"Si prob_fraude > {score_alto}  → ALERTA ALTA / DENEGAR\n"
+    formula_str += f"Si prob_fraude > {score_medio}  → REVISIÓN MANUAL\n"
+    formula_str += f"Si prob_fraude < {score_medio}  → APROBAR\n"
+
+    st.code(formula_str, language="python")
+
+    # Árbol destilado
+    with st.expander("🌳 Reglas del Árbol Destilado (implementables if/then en motor)"):
+        st.code(tree_rules, language="text")
+        st.caption("Árbol entrenado sobre las probabilidades del teacher. "
+                   "Cada rama = una regla if/then directamente implementable.")
+
+    # Score en transacciones individuales
+    st.markdown("### 🔍 Transacciones de Mayor Riesgo")
+    top_risk = (df.nlargest(200,"prob_fraude")
+                [[col_fecha, col_comercio, col_bin, col_monto, col_cod,
+                  col_ind, "prob_fraude","poc_flag","velocity_flag","es_n7"]]
+                .copy())
+    top_risk["prob_fraude"] = top_risk["prob_fraude"].map("{:.3f}".format)
+    top_risk["accion"] = top_risk["prob_fraude"].apply(
+        lambda x: "🔴 ALERTA ALTA" if float(x)>score_alto
+        else ("🟡 REVISIÓN" if float(x)>score_medio else "🟢 OK"))
+    st.dataframe(top_risk.head(50), use_container_width=True)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# TAB 4: REGLAS CANDIDATAS
+# ──────────────────────────────────────────────────────────────────────
+
+with tab4:
+    st.markdown("### Reglas Candidatas para el Motor")
+    st.caption("Generadas automáticamente desde el análisis de patrones. "
+               "Listas para proponer al equipo de motores.")
+
+    rules = []
+
+    # Reglas por fraud rate comercio
+    for comercio, row in ranking[ranking["fraud_rate"]>fraud_rate_thr].iterrows():
+        rules.append({
+            "tipo":"FRAUD_RATE", "severidad":"CRÍTICA",
+            "entidad": f"Comercio: {comercio}",
+            "condicion": f"comercio = '{comercio}' AND fraud_rate > {fraud_rate_thr:.0%}",
+            "accion":"ALERTA_ALTA",
+            "metrica": f"FR={row['fraud_rate']:.1%} | EFL=${row['efl']:.1f} | Txn={row['txn_total']}"
+        })
+
+    # Reglas POC
+    for bin_id, row in bin_stats[bin_stats["poc"]==1].iterrows():
+        rules.append({
+            "tipo":"PUNTO_COMPROMISO", "severidad":"CRÍTICA",
+            "entidad": f"BIN: {bin_id}",
+            "condicion": f"bin = '{bin_id}' AND tarjetas_distintas >= 3 AND fraud_rate > {fraud_rate_thr:.0%}",
+            "accion":"REVISAR_BIN",
+            "metrica": f"FR={row['fraud_rate']:.1%} | Tarjetas={int(row['tarjetas'])} | Bursts={int(row['bursts'])}"
+        })
+
+    # Reglas velocity
+    top_vel = bin_stats[bin_stats["bursts"]>5].sort_values("bursts",ascending=False).head(5)
+    for bin_id, row in top_vel.iterrows():
+        rules.append({
+            "tipo":"VELOCITY", "severidad":"ALTA",
+            "entidad": f"BIN: {bin_id}",
+            "condicion": f"bin = '{bin_id}' AND txn_en_{vel_window}s >= 3",
+            "accion":"DENEGAR_TEMPORALMENTE",
+            "metrica": f"Bursts={int(row['bursts'])} | FR={row['fraud_rate']:.1%}"
+        })
+
+    # Reglas N7 elevado
+    for comercio, row in ranking[ranking["ratio_n7"]>0.15].iterrows():
+        rules.append({
+            "tipo":"N7_ELEVADO", "severidad":"MEDIA",
+            "entidad": f"Comercio: {comercio}",
+            "condicion": f"comercio = '{comercio}' AND codigo_respuesta = 'N7'",
+            "accion":"REVISIÓN_MANUAL",
+            "metrica": f"Ratio N7={row['ratio_n7']:.1%} | CNP risk"
+        })
+
+    # Regla modelo — umbral score
+    rules.append({
+        "tipo":"SCORE_MODELO", "severidad":"DINÁMICA",
+        "entidad": "Todas las transacciones",
+        "condicion": f"prob_fraude > {score_alto} (Regresión Logística)",
+        "accion":"ALERTA_ALTA",
+        "metrica": f"AUC={metrics['lr_auc']:.3f} | Umbral={score_alto}"
+    })
+
+    # Filtro
+    tipos_disponibles = ["TODOS"] + list({r["tipo"] for r in rules})
+    filtro = st.selectbox("Filtrar por tipo", tipos_disponibles)
+    rules_show = rules if filtro=="TODOS" else [r for r in rules if r["tipo"]==filtro]
+
+    st.markdown(f"**{len(rules_show)} reglas** {'(filtradas)' if filtro!='TODOS' else 'generadas'}")
+
+    color_map = {
+        "CRÍTICA":"#ff3b5c","ALTA":"#ffad30",
+        "MEDIA":"#00d4ff","DINÁMICA":"#00e5a0"
+    }
+
+    for i, r in enumerate(rules_show, 1):
+        color = color_map.get(r["severidad"],"#8ba4c0")
+        st.markdown(f"""
+<div class="rule-card" style="border-left-color:{color}; background:#12192a;">
+  <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
+    <span style="background:{color}22; color:{color}; padding:2px 10px;
+                 border-radius:4px; font-size:11px; font-weight:700;
+                 font-family:monospace;">{r['tipo']}</span>
+    <span style="color:#8ba4c0; font-size:11px;">REGLA #{i}</span>
+  </div>
+  <div style="font-size:14px; font-weight:600; color:#e8eef7; margin-bottom:4px;">
+    {r['entidad']}
+  </div>
+  <div style="font-family:monospace; font-size:12px; color:#8ba4c0; margin-bottom:6px;">
+    IF {r['condicion']}
+  </div>
+  <div style="display:flex; gap:16px; align-items:center;">
+    <span style="font-size:11px; color:#8ba4c0;">ACCIÓN →</span>
+    <span style="background:{color}22; color:{color}; padding:2px 8px;
+                 border-radius:4px; font-size:11px; font-family:monospace;">
+      {r['accion']}
+    </span>
+    <span style="font-size:11px; color:#4a6080;">{r['metrica']}</span>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+    # Exportar reglas
+    st.markdown("### 📥 Exportar")
+    rules_df = pd.DataFrame(rules)
+    csv = rules_df.to_csv(index=False).encode("utf-8")
+    st.download_button("⬇️ Descargar reglas como CSV",
+                       data=csv, file_name="reglas_candidatas_fraude.csv",
+                       mime="text/csv")
+
+    st.download_button("⬇️ Descargar transacciones con score",
+                       data=df[[col_fecha,col_comercio,col_bin,col_monto,
+                                 col_cod,col_ind,"prob_fraude","prob_fraude_lr",
+                                 "poc_flag","velocity_flag","es_n7"]
+                               ].to_csv(index=False).encode("utf-8"),
+                       file_name="transacciones_con_score.csv",
+                       mime="text/csv")
+
+
+
+----   README
+# 🛡️ Fraud Analyzer — Scotiabank Peru
+
+App Streamlit para análisis de fraude transaccional por comercio,
+detección de Punto de Compromiso (POC), modelado y generación de reglas.
+
+## Instalación
+
+```bash
+pip install -r requirements.txt
+```
+
+## Cómo correr
+
+```bash
+streamlit run app.py
+```
+
+Abre automáticamente en: http://localhost:8501
+
+---
+
+## Flujo de uso
+
+1. **Sidebar → Datos**
+   - Activa "Usar datos sintéticos" para demo inmediato
+   - O sube un CSV/Excel exportado del Monitor
+
+2. **Sidebar → Mapeo de columnas**
+   - Ajusta los nombres de columna según tu export
+   - Columnas clave: fecha, monto, comercio, bin, indicador_fraude, codigo_respuesta
+
+3. **Sidebar → Parámetros**
+   - Ajusta umbrales de fraud rate, scores y ventana velocity
+
+---
+
+## Secciones
+
+### 🏪 Comercios
+- Ranking por score de riesgo compuesto (fraud rate + EFL + severidad)
+- Scatter fraud rate vs EFL con detección de POC
+- Evolución mensual por comercio seleccionado
+
+### 💳 BINs & POC
+- Detección automática de Punto de Compromiso
+- Scatter tarjetas afectadas vs fraud rate
+- Top BINs con velocity bursts
+
+### 🤖 Modelo & Score
+- Teacher model (LightGBM/RandomForest) + Regresión Logística
+- Curva ROC comparativa
+- Distribución de scores por clase
+- **Fórmula lista para implementar en el motor**
+- Árbol destilado (reglas if/then)
+
+### ⚙️ Reglas Candidatas
+- Generación automática de reglas por tipo:
+  - FRAUD_RATE: comercios sobre umbral
+  - PUNTO_COMPROMISO: BINs comprometidos
+  - VELOCITY: ráfagas por BIN
+  - N7_ELEVADO: riesgo CNP
+  - SCORE_MODELO: umbral de probabilidad
+- Exportar reglas como CSV
+- Exportar transacciones con score
+
+---
+
+## Lógica de etiquetado (target)
+
+| Indicador | Significado | Uso en modelo |
+|-----------|------------|---------------|
+| F | Fraude confirmado | ✅ Positivo (train) |
+| G | Buena confirmada | ✅ Negativo (train) |
+| D | Descarte analista | ⚠️ Negativo peso 0.5 |
+| N | Sin revisar | 🔲 Solo inferencia |
+| P | Pendiente | ❌ Excluido |
+
+## Códigos de respuesta críticos
+
+| Código | Significado | Uso |
+|--------|------------|-----|
+| N7 | CVV2 no coincide | Feature fuerte CNP fraud |
+| 04 | Tarjeta robada | Feature crítica |
+| 14 | Tarjeta inválida | Posible BIN testing |
+| 51 | Sin fondos | Feature comportamiento |
+| 59/53/69 | Regla interna | Ya en radar del motor |
+| 00 | Aprobada | Baseline |
+
+
+--- REQUERIMIENTOS
+
+streamlit>=1.32.0
+pandas>=2.0.0
+numpy>=1.24.0
+plotly>=5.18.0
+scikit-learn>=1.3.0
+lightgbm>=4.0.0
+openpyxl>=3.1.0
+
