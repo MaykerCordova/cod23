@@ -148,13 +148,13 @@ def extract_tables_from_emails(df2: pd.DataFrame) -> None:
 
     # Filtrar en Outlook solo correos posteriores a ultima_fecha.
     # Outlook usa MM/DD/YYYY en el filtro Restrict.
+
     fecha_filtro = ultima_fecha + timedelta(days=1)
-    fecha_filtro_str = fecha_filtro.strftime("%m/%d/%Y")
-    items = items.Restrict(f"[ReceivedTime] >= '{fecha_filtro_str} 00:00 AM'")
+
     items.Sort("[ReceivedTime]", True)
 
-    print(f"[INFO] Buscando correos con ReceivedTime >= {fecha_filtro_str}")
-    print(f"[INFO] Correos encontrados: {items.Count}")
+    print(f"[INFO] Buscando correos desde fecha_datos > {ultima_fecha}")
+    print(f"[INFO] Correos totales en carpeta: {items.Count}")
 
     # {fecha: {"UBA": int | None, "SBP": int | None}}
     buffer: dict[date, dict] = {}
@@ -163,6 +163,10 @@ def extract_tables_from_emails(df2: pd.DataFrame) -> None:
         try:
             if item.Class != 43:    # 43 = MailItem
                 continue
+            # Filtro manual (reemplaza el Restrict que fallaba)
+              received_date = item.ReceivedTime.date()
+              if received_date < fecha_filtro:
+                   continue
 
             fecha_datos = (item.ReceivedTime - timedelta(days=1)).date()
             print(f"[DEBUG] {item.Subject[:40]} | fecha_datos: {fecha_datos}")
