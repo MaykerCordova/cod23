@@ -476,7 +476,9 @@ def feature_engineering(df, fraud_rate_thr, vel_window):
     def zscore(g):
         mu, sig = g["monto"].mean(), g["monto"].std()
         return ((g["monto"]-mu)/(sig+1e-6)).fillna(0)
-    df["zscore_monto"] = df.groupby("comercio", group_keys=False).apply(zscore)
+    df["zscore_monto"] = (df.groupby("comercio", group_keys=False)["monto"]
+                        .transform(lambda x: (x - x.mean()) / (x.std() + 1e-6))
+                        .fillna(0))
 
     # ── Stats por BIN ─────────────────────────────────────────────────
     bs = (clean.groupby("bin")
