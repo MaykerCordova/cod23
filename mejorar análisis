@@ -491,20 +491,54 @@ def feature_engineering(df, fraud_rate_thr, vel_window):
     df = df.merge(bs[["bin_fr","bin_tarjetas","poc_flag"]], on="bin", how="left")
 
     # ── Velocity por BIN (fecha+hora combinada) ───────────────────────
-    if "fecha_hora" in df.columns and df["fecha_hora"].notna().any():
-        df_v = df[df["fecha_hora"].notna()].sort_values(["bin","fecha_hora"]).copy()
-        df_v["ts"] = df_v["fecha_hora"].astype(np.int64)//1_000_000_000
+# ── Velocity — 3 niveles ──────────────────────────────────────────────
+if "fecha_hora" in df.columns and df["fecha_hora"].notna().any():
+    df_v = df[df["fecha_hora"].notna()].sort_values(
+        ["bin","fecha_hora"]).copy()
+    df_v["ts"] = df_v["fecha_hora"].astype(np.int64)//1_000_000_000
 
-        def vel_flag(g):
+    def make_vel_flag(group_col, window, min_txn=3):
+        """
+        Genera flag de velocity para cualquier columna de agrupación.
+        window: ventana en segundos
+        min_txn: mínimo de txn en la ventana para flag=1
+        """
+        def vel(g):
             ts = g["ts"].values
             return pd.Series(
-                [1 if ((ts>=t-vel_window)&(ts<=t+vel_window)).sum()>=3 else 0
+                [1 if ((ts>=t-window)&(ts<=t+window)).sum()>=min_txn else 0
                  for t in ts], index=g.index)
+        return df_v.groupby(group_col, group_keys=False).apply(vel)
 
-        vel_series = df_v.groupby("bin", group_keys=False).apply(vel_flag)
-        df["velocity_flag"] = vel_series.reindex(df.index).fillna(0).astype(int)
+    # Nivel 1: por tarjeta — misma tarjeta, 3 txn en 60s
+    col_tar = next((c for c in df_v.columns 
+                    if "tarjeta_registro" in c), None)
+    if col_tar:
+        vel_tar = make_vel_flag(col_tar, window=vel_window, min_txn=3)
+        df["velocity_tarjeta"] = vel_tar.reindex(df.index).fillna(0).astype(int)
     else:
-        df["velocity_flag"] = 0
+        df["velocity_tarjeta"] = 0
+
+    # Nivel 2: por BIN — mismo BIN, 5 txn en 60s (umbral más alto)
+    vel_bin = make_vel_flag("bin", window=vel_window, min_txn=5)
+    df["velocity_bin"] = vel_bin.reindex(df.index).fillna(0).astype(int)
+
+    # Nivel 3: por comercio — mismo comercio, 10 txn en 60s
+    vel_com = make_vel_flag("comercio", window=vel_window, min_txn=10)
+    df["velocity_comercio"] = vel_com.reindex(df.index).fillna(0).astype(int)
+
+    # Flag combinado — si cualquiera de los 3 se activa
+    df["velocity_flag"] = (
+        (df["velocity_tarjeta"]==1) |
+        (df["velocity_bin"]==1)     |
+        (df["velocity_comercio"]==1)
+    ).astype(int)
+
+else:
+    df["velocity_tarjeta"] = 0
+    df["velocity_bin"]     = 0
+    df["velocity_comercio"]= 0
+    df["velocity_flag"]    = 0
 
     # ── Encodings ─────────────────────────────────────────────────────
     for col in ["acf_canal","acf_entry_mode","acf_mcc_","acf_tipo_prod_tc"]:
