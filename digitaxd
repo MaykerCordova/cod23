@@ -1,0 +1,513 @@
+"""
+================================================================================
+EDA + INGENIERÍA DE VARIABLES — TRANSFERENCIAS INMEDIATAS
+Prevención de Fraude | Scotiabank Perú
+================================================================================
+INSTRUCCIONES:
+  1. Ajusta el bloque CONFIGURACIÓN con tus nombres de columna reales
+  2. Ajusta las rutas de archivo
+  3. Corre celda por celda en Jupyter o ejecuta completo
+================================================================================
+"""
+
+import polars as pl
+import polars.selectors as cs
+import numpy as np
+from pathlib import Path
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CONFIGURACIÓN — SOLO MODIFICA ESTE BLOQUE
+# ──────────────────────────────────────────────────────────────────────────────
+
+RUTA_8750 = r"C:\Users\s4930359\Data_Herramientas\data\transferencias\8750_marzo.csv"
+RUTA_8850 = r"C:\Users\s4930359\Data_Herramientas\data\transferencias\8850_marzo.csv"
+
+# Mapea TUS nombres de columna → nombre estándar usado en este script
+COLUMNAS = {
+    "cliente_id":      "cliente_id",        # ID único de cliente
+    "monto":           "monto",             # Monto de la transferencia
+    "saldo":           "saldo_disponible",  # Saldo disponible antes de la trx
+    "fecha_trx":       "fecha_trx",         # Fecha (date o datetime)
+    "hora_trx":        "hora_trx",          # Hora en formato HH:MM:SS o datetime
+    "banco_destino":   "banco_destino",     # Nombre del banco destino
+    "cuenta_destino":  "cuenta_destino",    # Número de cuenta destino
+    "canal":           "canal",             # App / Web / Teléfono / etc.
+    "metodo_auth":     "metodo_auth",       # Token / Biometría / Clave / OTP
+    "segmento":        "segmento",          # Segmento del cliente
+    "indicador":       "indicador_fraude",  # F / N / G / D / P
+}
+
+# Banco destino de interés (ajusta si el valor exacto en tu data es distinto)
+BANCO_RIESGO = "INTERBANK"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 1. CARGA Y PREPARACIÓN
+# ──────────────────────────────────────────────────────────────────────────────
+
+def cargar_y_preparar(ruta: str, cols: dict, encoding: str = "latin-1") -> pl.DataFrame:
+    """Carga el CSV, renombra columnas y prepara tipos base."""
+    df = (
+        pl.read_csv(ruta, encoding=encoding, infer_schema_length=10000)
+        .rename({v_orig: v_std for v_orig, v_std in cols.items()
+                 if v_orig in pl.read_csv(ruta, encoding=encoding, n_rows=0).columns})
+    )
+
+    # Parsear datetime combinando fecha + hora si están separadas
+    if "fecha_trx" in df.columns and "hora_trx" in df.columns:
+        if df["fecha_trx"].dtype == pl.Utf8:
+            df = df.with_columns(
+                pl.concat_str(["fecha_trx", "hora_trx"], separator=" ")
+                  .str.to_datetime(format="%Y-%m-%d %H:%M:%S", strict=False)
+                  .alias("datetime_trx")
+            )
+        else:
+            df = df.with_columns(
+                pl.col("fecha_trx").cast(pl.Datetime).alias("datetime_trx")
+            )
+    elif "fecha_trx" in df.columns:
+        df = df.with_columns(
+            pl.col("fecha_trx").str.to_datetime(strict=False).alias("datetime_trx")
+        )
+
+    # Variable objetivo binaria: F=1, resto=0
+    if "indicador_fraude" in df.columns:
+        df = df.with_columns(
+            (pl.col("indicador_fraude") == "F").cast(pl.Int8).alias("es_fraude")
+        )
+
+    # Tipos numéricos
+    for col in ["monto", "saldo_disponible"]:
+        if col in df.columns:
+            df = df.with_columns(pl.col(col).cast(pl.Float64, strict=False))
+
+    return df
+
+
+print("Cargando datasets...")
+df_8750 = cargar_y_preparar(RUTA_8750, COLUMNAS)
+df_8850 = cargar_y_preparar(RUTA_8850, COLUMNAS)
+
+print(f"  8750 (universo completo): {df_8750.shape[0]:,} filas")
+print(f"  8850 (revisado analistas): {df_8850.shape[0]:,} filas")
+print(f"  Fraudes en 8850: {df_8850['es_fraude'].sum():,} "
+      f"({df_8850['es_fraude'].mean()*100:.2f}%)")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 2. INGENIERÍA DE VARIABLES
+# ──────────────────────────────────────────────────────────────────────────────
+
+def construir_features(df: pl.DataFrame) -> pl.DataFrame:
+    """Construye todas las familias de features sobre el DataFrame."""
+
+    # Ordenar por cliente y tiempo — CRÍTICO para ventanas
+    df = df.sort(["cliente_id", "datetime_trx"])
+
+    # ── 2.1 Features temporales ───────────────────────────────────────────────
+    df = df.with_columns([
+        pl.col("datetime_trx").dt.hour().alias("hora"),
+        pl.col("datetime_trx").dt.weekday().alias("dia_semana"),  # 0=Lun, 6=Dom
+        pl.col("datetime_trx").dt.timestamp("ms").alias("ts_ms"),
+    ])
+
+    df = df.with_columns([
+        # Horario nocturno
+        ((pl.col("hora") >= 22) | (pl.col("hora") <= 6))
+            .cast(pl.Int8).alias("flag_nocturno"),
+        # Fin de semana
+        (pl.col("dia_semana") >= 5)
+            .cast(pl.Int8).alias("flag_fin_semana"),
+        # Encoding cíclico
+        (2 * np.pi * pl.col("hora") / 24).sin().alias("hora_sin"),
+        (2 * np.pi * pl.col("hora") / 24).cos().alias("hora_cos"),
+    ])
+
+    # ── 2.2 Tiempo desde última transacción del cliente (segundos) ────────────
+    df = df.with_columns(
+        pl.col("ts_ms").diff().over("cliente_id").alias("ms_desde_ultima_trx")
+    ).with_columns(
+        (pl.col("ms_desde_ultima_trx") / 1000).alias("seg_desde_ultima_trx")
+    )
+
+    # ── 2.3 Ratio monto / saldo ───────────────────────────────────────────────
+    df = df.with_columns([
+        (pl.col("monto") / (pl.col("saldo_disponible") + 1))
+            .alias("ratio_monto_saldo"),
+    ])
+    df = df.with_columns([
+        (pl.col("ratio_monto_saldo") > 0.85).cast(pl.Int8).alias("flag_vaciado"),
+    ])
+
+    # ── 2.4 Banco destino de riesgo ───────────────────────────────────────────
+    df = df.with_columns(
+        (pl.col("banco_destino").str.to_uppercase().str.contains(BANCO_RIESGO))
+            .cast(pl.Int8).alias("flag_dest_riesgo")
+    )
+
+    # ── 2.5 Primera vez que cliente transfiere a esta cuenta destino ──────────
+    # Rank por (cliente_id, cuenta_destino) ordenado en el tiempo
+    df = df.with_columns(
+        pl.col("datetime_trx")
+          .rank("ordinal")
+          .over(["cliente_id", "cuenta_destino"])
+          .alias("rank_cuenta_destino")
+    )
+    df = df.with_columns(
+        (pl.col("rank_cuenta_destino") == 1).cast(pl.Int8).alias("es_primera_vez_destino")
+    )
+
+    # ── 2.6 Cuentas mula — cuántos clientes distintos recibió esa cuenta ─────
+    receptores = (
+        df.group_by("cuenta_destino")
+          .agg([
+              pl.col("cliente_id").n_unique().alias("n_clientes_a_cuenta_destino"),
+              pl.col("monto").sum().alias("monto_total_recibido_cuenta"),
+          ])
+    )
+    df = df.join(receptores, on="cuenta_destino", how="left")
+
+    # ── 2.7 Ventanas de velocidad por cliente ─────────────────────────────────
+    # Polars rolling sobre grupos — usamos sort + group_by_dynamic
+    # Calculamos: n_trx y monto_acum en ventanas de 3min, 5min, 1h, 12h, 24h
+
+    ventanas = {
+        "3min":  3 * 60 * 1000,
+        "5min":  5 * 60 * 1000,
+        "1h":    1 * 3600 * 1000,
+        "12h":  12 * 3600 * 1000,
+        "24h":  24 * 3600 * 1000,
+    }
+
+    # Para ventanas rolling necesitamos ts como columna de índice
+    # Estrategia: self-join con filtro de ventana (eficiente en Polars lazy)
+    for nombre, ms in ventanas.items():
+        ventana_roll = (
+            df.lazy()
+              .sort(["cliente_id", "ts_ms"])
+              .with_columns([
+                  pl.col("ts_ms")
+                    .rolling_count(window_size=f"{ms}i", by="ts_ms")
+                    .over("cliente_id")
+                    .alias(f"n_trx_{nombre}"),
+                  pl.col("monto")
+                    .rolling_sum(window_size=f"{ms}i", by="ts_ms")
+                    .over("cliente_id")
+                    .alias(f"monto_acum_{nombre}"),
+              ])
+              .collect()
+        )
+        # Agregar columnas al df principal
+        df = df.with_columns([
+            ventana_roll[f"n_trx_{nombre}"],
+            ventana_roll[f"monto_acum_{nombre}"],
+        ])
+
+    # ── 2.8 Ratio monto vs promedio del segmento ──────────────────────────────
+    avg_segmento = (
+        df.group_by("segmento")
+          .agg(pl.col("monto").mean().alias("avg_monto_segmento"))
+    )
+    df = df.join(avg_segmento, on="segmento", how="left")
+    df = df.with_columns(
+        (pl.col("monto") / (pl.col("avg_monto_segmento") + 1))
+            .alias("ratio_monto_vs_segmento")
+    )
+
+    # ── 2.9 Features compuestas ───────────────────────────────────────────────
+    df = df.with_columns([
+        # Ráfaga hacia banco de riesgo
+        ((pl.col("n_trx_5min") >= 2) & (pl.col("flag_dest_riesgo") == 1))
+            .cast(pl.Int8).alias("flag_rafaga_destino_riesgo"),
+        # Vaciado hacia cuenta nueva
+        ((pl.col("flag_vaciado") == 1) & (pl.col("es_primera_vez_destino") == 1))
+            .cast(pl.Int8).alias("flag_vaciado_cuenta_nueva"),
+        # Triple señal: ráfaga + nocturno + destino riesgo
+        ((pl.col("n_trx_5min") >= 2) &
+         (pl.col("flag_nocturno") == 1) &
+         (pl.col("flag_dest_riesgo") == 1))
+            .cast(pl.Int8).alias("flag_alto_riesgo"),
+    ])
+
+    return df
+
+
+print("\nConstruyendo features en 8850 (dataset con indicador de fraude)...")
+df_8850_feat = construir_features(df_8850)
+print("  ✓ Features construidas")
+
+print("\nConstruyendo features en 8750 (universo completo)...")
+df_8750_feat = construir_features(df_8750)
+print("  ✓ Features construidas")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 3. ANÁLISIS DE DISCRIMINACIÓN POR FEATURE
+# ──────────────────────────────────────────────────────────────────────────────
+
+print("\n" + "="*70)
+print("ANÁLISIS DE DISCRIMINACIÓN — BASE 8850 (con indicador fraude)")
+print("="*70)
+
+
+def tasa_fraude_por_flag(df: pl.DataFrame, col_flag: str) -> pl.DataFrame:
+    """Para features binarias: tasa de fraude cuando flag=1 vs flag=0."""
+    return (
+        df.group_by(col_flag)
+          .agg([
+              pl.len().alias("n_trx"),
+              pl.col("es_fraude").sum().alias("n_fraudes"),
+              pl.col("es_fraude").mean().alias("fraud_rate"),
+              pl.col("monto").sum().alias("monto_total"),
+          ])
+          .sort(col_flag)
+          .with_columns(
+              (pl.col("monto_total") / pl.col("monto_total").sum() * 100)
+                  .alias("pct_monto")
+          )
+    )
+
+
+def tasa_fraude_por_decil(df: pl.DataFrame, col_num: str, n: int = 10) -> pl.DataFrame:
+    """Para features numéricas: divide en deciles y calcula tasa de fraude."""
+    return (
+        df.with_columns(
+            pl.col(col_num)
+              .qcut(n, labels=[str(i) for i in range(1, n+1)])
+              .alias(f"decil_{col_num}")
+        )
+        .group_by(f"decil_{col_num}")
+        .agg([
+            pl.len().alias("n_trx"),
+            pl.col("es_fraude").sum().alias("n_fraudes"),
+            pl.col("es_fraude").mean().alias("fraud_rate"),
+            pl.col("monto").sum().alias("monto_fraudulento")
+                .filter(pl.col("es_fraude") == 1),
+        ])
+        .sort(f"decil_{col_num}")
+    )
+
+
+# ── 3.1 Features binarias ─────────────────────────────────────────────────────
+flags_binarios = [
+    "flag_nocturno",
+    "flag_fin_semana",
+    "flag_vaciado",
+    "flag_dest_riesgo",
+    "es_primera_vez_destino",
+    "flag_rafaga_destino_riesgo",
+    "flag_vaciado_cuenta_nueva",
+    "flag_alto_riesgo",
+]
+
+print("\n── FEATURES BINARIAS ────────────────────────────────────────────────")
+resumen_flags = []
+for flag in flags_binarios:
+    if flag not in df_8850_feat.columns:
+        continue
+    t = tasa_fraude_por_flag(df_8850_feat, flag)
+    fila_1 = t.filter(pl.col(flag) == 1)
+    fila_0 = t.filter(pl.col(flag) == 0)
+    if fila_1.is_empty() or fila_0.is_empty():
+        continue
+    fr_1 = fila_1["fraud_rate"][0]
+    fr_0 = fila_0["fraud_rate"][0]
+    lift = fr_1 / (fr_0 + 1e-10)
+    n1 = fila_1["n_trx"][0]
+    nf1 = fila_1["n_fraudes"][0]
+    resumen_flags.append({
+        "feature": flag,
+        "fraud_rate_flag1": round(fr_1 * 100, 2),
+        "fraud_rate_flag0": round(fr_0 * 100, 2),
+        "lift": round(lift, 2),
+        "n_trx_flag1": n1,
+        "n_fraudes_capturados": nf1,
+    })
+
+resumen_flags_df = (
+    pl.DataFrame(resumen_flags)
+      .sort("lift", descending=True)
+)
+print(resumen_flags_df)
+
+
+# ── 3.2 Features numéricas por decil ─────────────────────────────────────────
+print("\n── RATIO MONTO/SALDO POR DECIL ──────────────────────────────────────")
+print(tasa_fraude_por_decil(df_8850_feat, "ratio_monto_saldo"))
+
+print("\n── N_TRX_5MIN POR VALOR ─────────────────────────────────────────────")
+print(
+    df_8850_feat.group_by("n_trx_5min")
+    .agg([
+        pl.len().alias("n_trx"),
+        pl.col("es_fraude").sum().alias("n_fraudes"),
+        pl.col("es_fraude").mean().alias("fraud_rate"),
+    ])
+    .sort("n_trx_5min")
+)
+
+print("\n── N_CLIENTES_A_CUENTA_DESTINO POR DECIL ───────────────────────────")
+print(tasa_fraude_por_decil(df_8850_feat, "n_clientes_a_cuenta_destino"))
+
+
+# ── 3.3 Análisis banco destino ────────────────────────────────────────────────
+print("\n── TASA DE FRAUDE POR BANCO DESTINO (Top 15) ───────────────────────")
+print(
+    df_8850_feat.group_by("banco_destino")
+    .agg([
+        pl.len().alias("n_trx"),
+        pl.col("es_fraude").sum().alias("n_fraudes"),
+        pl.col("es_fraude").mean().alias("fraud_rate"),
+        pl.col("monto").filter(pl.col("es_fraude") == 1).sum().alias("monto_fraude"),
+    ])
+    .sort("monto_fraude", descending=True)
+    .head(15)
+)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 4. EVALUACIÓN DE REGLAS DE CONTROL
+# ──────────────────────────────────────────────────────────────────────────────
+
+print("\n" + "="*70)
+print("EVALUACIÓN DE REGLAS DE CONTROL — BASE 8850")
+print("="*70)
+
+def evaluar_regla(df: pl.DataFrame, nombre: str, expr_regla: pl.Expr):
+    """
+    Evalúa una regla de control mostrando:
+    - Precision: % de alertas que son fraude real
+    - Recall: % de fraudes reales capturados por la regla
+    - Trx bloqueadas normales (falsos positivos)
+    """
+    df_eval = df.with_columns(expr_regla.cast(pl.Int8).alias("_alerta"))
+    
+    tp = df_eval.filter((pl.col("_alerta") == 1) & (pl.col("es_fraude") == 1)).shape[0]
+    fp = df_eval.filter((pl.col("_alerta") == 1) & (pl.col("es_fraude") == 0)).shape[0]
+    fn = df_eval.filter((pl.col("_alerta") == 0) & (pl.col("es_fraude") == 1)).shape[0]
+    
+    total_fraudes = df["es_fraude"].sum()
+    total_alertas = tp + fp
+    
+    precision  = tp / (total_alertas + 1e-10)
+    recall     = tp / (total_fraudes + 1e-10)
+    f1         = 2 * precision * recall / (precision + recall + 1e-10)
+    
+    monto_fraude_capturado = (
+        df_eval.filter((pl.col("_alerta") == 1) & (pl.col("es_fraude") == 1))
+               ["monto"].sum()
+    )
+    monto_total_fraude = df_eval.filter(pl.col("es_fraude") == 1)["monto"].sum()
+    
+    print(f"\n  Regla: {nombre}")
+    print(f"  {'─'*50}")
+    print(f"  Alertas generadas : {total_alertas:,}  ({total_alertas/df.shape[0]*100:.1f}% del total)")
+    print(f"  Fraudes capturados: {tp:,} / {total_fraudes:,}  (Recall = {recall*100:.1f}%)")
+    print(f"  Falsos positivos  : {fp:,}")
+    print(f"  Precision         : {precision*100:.1f}%")
+    print(f"  F1-Score          : {f1:.3f}")
+    print(f"  Monto fraude capt.: S/ {monto_fraude_capturado:,.0f} / S/ {monto_total_fraude:,.0f} ({monto_fraude_capturado/monto_total_fraude*100:.1f}%)")
+
+
+# Regla 1: Solo banco destino de riesgo
+evaluar_regla(
+    df_8850_feat,
+    "R1 — Banco destino riesgo",
+    pl.col("flag_dest_riesgo") == 1
+)
+
+# Regla 2: Ráfaga en 5min
+evaluar_regla(
+    df_8850_feat,
+    "R2 — Ráfaga ≥ 2 trx en 5 min",
+    pl.col("n_trx_5min") >= 2
+)
+
+# Regla 3: Vaciado de cuenta
+evaluar_regla(
+    df_8850_feat,
+    "R3 — Ratio monto/saldo > 85%",
+    pl.col("ratio_monto_saldo") > 0.85
+)
+
+# Regla 4: Destino riesgo + primera vez
+evaluar_regla(
+    df_8850_feat,
+    "R4 — Banco riesgo + primera vez a esa cuenta",
+    (pl.col("flag_dest_riesgo") == 1) & (pl.col("es_primera_vez_destino") == 1)
+)
+
+# Regla 5: Ráfaga + destino riesgo
+evaluar_regla(
+    df_8850_feat,
+    "R5 — Ráfaga 5min + banco riesgo",
+    pl.col("flag_rafaga_destino_riesgo") == 1
+)
+
+# Regla 6: Vaciado + cuenta nueva
+evaluar_regla(
+    df_8850_feat,
+    "R6 — Vaciado + primera vez a esa cuenta",
+    pl.col("flag_vaciado_cuenta_nueva") == 1
+)
+
+# Regla 7: Combinación alta riesgo (triple señal)
+evaluar_regla(
+    df_8850_feat,
+    "R7 — Triple señal (ráfaga + nocturno + banco riesgo)",
+    pl.col("flag_alto_riesgo") == 1
+)
+
+# Regla 8: OR de múltiples señales moderadas
+evaluar_regla(
+    df_8850_feat,
+    "R8 — Cualquier señal moderada (R3 OR R4 OR R5)",
+    (
+        (pl.col("ratio_monto_saldo") > 0.85) |
+        ((pl.col("flag_dest_riesgo") == 1) & (pl.col("es_primera_vez_destino") == 1)) |
+        (pl.col("flag_rafaga_destino_riesgo") == 1)
+    )
+)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 5. ANÁLISIS DE CUENTAS MULA
+# ──────────────────────────────────────────────────────────────────────────────
+
+print("\n" + "="*70)
+print("ANÁLISIS DE CUENTAS MULA — TOP CUENTAS DESTINO SOSPECHOSAS")
+print("="*70)
+
+cuentas_mula = (
+    df_8850_feat
+    .group_by(["cuenta_destino", "banco_destino"])
+    .agg([
+        pl.col("cliente_id").n_unique().alias("n_clientes_distintos"),
+        pl.len().alias("n_trx_recibidas"),
+        pl.col("monto").sum().alias("monto_total_recibido"),
+        pl.col("es_fraude").sum().alias("n_fraudes_asociados"),
+        pl.col("es_fraude").mean().alias("fraud_rate"),
+    ])
+    .filter(pl.col("n_clientes_distintos") >= 2)  # al menos 2 clientes distintos
+    .sort("n_clientes_distintos", descending=True)
+    .head(20)
+)
+
+print(cuentas_mula)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 6. EXPORTAR FEATURES Y RESUMEN
+# ──────────────────────────────────────────────────────────────────────────────
+
+OUTPUT_DIR = Path(r"C:\Users\s4930359\Data_Herramientas\data\Gold\transferencias")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+df_8850_feat.write_parquet(OUTPUT_DIR / "8850_marzo_features.parquet")
+df_8750_feat.write_parquet(OUTPUT_DIR / "8750_marzo_features.parquet")
+resumen_flags_df.write_csv(OUTPUT_DIR / "resumen_discriminacion_flags.csv")
+cuentas_mula.write_csv(OUTPUT_DIR / "cuentas_mula_sospechosas.csv")
+
+print(f"\n✓ Archivos exportados a: {OUTPUT_DIR}")
+print("\n" + "="*70)
+print("FIN DEL ANÁLISIS")
+print("="*70)
