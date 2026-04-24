@@ -1,0 +1,453 @@
+"""
+================================================================================
+EDA + INGENIERÍA DE VARIABLES — TRANSFERENCIAS INMEDIATAS
+Prevención de Fraude | Scotiabank Perú
+v5 — 100% Pandas 2.2.3  |  Sin canal, sin saldo, auth pendiente
+================================================================================
+INSTRUCCIONES:
+  1. Ajusta el bloque CONFIGURACIÓN con tus nombres de columna reales
+  2. Ajusta la ruta del archivo 8750
+  3. Corre en Jupyter o ejecuta completo
+================================================================================
+"""
+
+import pandas as pd
+import numpy as np
+from pathlib import Path
+
+print(f"Pandas version: {pd.__version__}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CONFIGURACIÓN — SOLO MODIFICA ESTE BLOQUE
+# ──────────────────────────────────────────────────────────────────────────────
+
+RUTA_8750 = r"C:\Users\s4930359\Data_Herramientas\data\transferencias\8750_marzo.csv"
+
+# Cambia el VALOR (lado derecho) por el nombre exacto en tu archivo
+COLUMNAS = {
+    "cliente_id":     "cliente_id",        # ID único de cliente
+    "monto":          "monto",             # Monto de la transferencia
+    "fecha_trx":      "fecha_trx",         # Fecha
+    "hora_trx":       "hora_trx",          # Hora HH:MM:SS
+    "banco_destino":  "banco_destino",     # Banco destino
+    "cuenta_destino": "cuenta_destino",    # Número de cuenta destino
+    "segmento":       "segmento",          # Segmento del cliente
+    "indicador":      "indicador_fraude",  # F / N / G / D / P
+    # ── PENDIENTES — descomenta cuando tengas las columnas ──────────────────
+    # "saldo":           "saldo_disponible",
+    # "canal":           "canal",
+    # "nombre_comercio": "nombre_comercio",
+}
+
+BANCO_RIESGO = "INTERBANK"
+
+OUTPUT_DIR = Path(r"C:\Users\s4930359\Data_Herramientas\data\Gold\transferencias")
+
+# Ajusta estos umbrales según el rango de montos de tu data
+UMBRALES = [500, 1000, 1500, 2000, 3000, 5000, 7500, 10000, 15000, 20000]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 1. CARGA Y PREPARACIÓN
+# ──────────────────────────────────────────────────────────────────────────────
+
+print("\n" + "="*70)
+print("1. CARGANDO Y PREPARANDO DATA")
+print("="*70)
+
+df = pd.read_csv(RUTA_8750, encoding="latin-1", low_memory=False)
+
+# Renombrar columnas — solo las que existen
+rename_map = {v: k for k, v in COLUMNAS.items() if v in df.columns}
+df = df.rename(columns=rename_map)
+
+# Parsear datetime
+if "fecha_trx" in df.columns and "hora_trx" in df.columns:
+    df["datetime_trx"] = pd.to_datetime(
+        df["fecha_trx"].astype(str) + " " + df["hora_trx"].astype(str),
+        format="%Y-%m-%d %H:%M:%S",
+        errors="coerce"
+    )
+elif "fecha_trx" in df.columns:
+    df["datetime_trx"] = pd.to_datetime(df["fecha_trx"], errors="coerce")
+
+# Monto a float
+df["monto"] = pd.to_numeric(df["monto"], errors="coerce")
+
+# Variable objetivo: F=1, resto=0
+df["es_fraude"] = (df["indicador_fraude"] == "F").astype(int)
+
+total_fraudes  = df["es_fraude"].sum()
+total_trx      = len(df)
+monto_fraude_total = df.loc[df["es_fraude"] == 1, "monto"].sum()
+
+print(f"  Filas totales      : {total_trx:,}")
+print(f"  Fraudes (F)        : {total_fraudes:,}")
+print(f"  Fraud rate global  : {total_fraudes/total_trx*100:.3f}%")
+print(f"  Monto total fraude : S/ {monto_fraude_total:,.0f}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 2. DISTRIBUCIÓN POR INDICADOR DE FRAUDE
+# ──────────────────────────────────────────────────────────────────────────────
+
+print("\n" + "="*70)
+print("2. DISTRIBUCIÓN POR INDICADOR DE FRAUDE")
+print("   F=Fraude | N=Normal | G=Good | D=Descarte | P=Pendiente")
+print("="*70)
+
+resumen_ind = (
+    df.groupby("indicador_fraude")
+      .agg(
+          n_trx        = ("monto", "count"),
+          n_clientes   = ("cliente_id", "nunique"),
+          monto_total  = ("monto", "sum"),
+          monto_prom   = ("monto", "mean"),
+          monto_mediana= ("monto", "median"),
+          monto_maximo = ("monto", "max"),
+      )
+      .reset_index()
+)
+resumen_ind["pct_trx"]   = (resumen_ind["n_trx"]   / resumen_ind["n_trx"].sum()   * 100).round(2)
+resumen_ind["pct_monto"] = (resumen_ind["monto_total"] / resumen_ind["monto_total"].sum() * 100).round(2)
+resumen_ind = resumen_ind.sort_values("monto_total", ascending=False)
+print(resumen_ind.to_string(index=False))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 3. INGENIERÍA DE VARIABLES
+# ──────────────────────────────────────────────────────────────────────────────
+
+print("\n" + "="*70)
+print("3. CONSTRUYENDO FEATURES")
+print("="*70)
+
+# Ordenar por cliente y tiempo — CRÍTICO para rolling
+df = df.sort_values(["cliente_id", "datetime_trx"]).reset_index(drop=True)
+
+# ── 3.1 Temporales ────────────────────────────────────────────────────────────
+df["hora"]       = df["datetime_trx"].dt.hour
+df["dia_semana"] = df["datetime_trx"].dt.dayofweek   # 0=Lun, 6=Dom
+
+df["flag_nocturno"]   = ((df["hora"] >= 22) | (df["hora"] <= 6)).astype(int)
+df["flag_fin_semana"] = (df["dia_semana"] >= 5).astype(int)
+df["hora_sin"]        = np.sin(2 * np.pi * df["hora"] / 24)
+df["hora_cos"]        = np.cos(2 * np.pi * df["hora"] / 24)
+
+# ── 3.2 Tiempo desde última trx del cliente (segundos) ───────────────────────
+df["seg_desde_ultima_trx"] = (
+    df.groupby("cliente_id")["datetime_trx"]
+      .diff()
+      .dt.total_seconds()
+)
+
+# ── 3.3 Saldo disponible — PENDIENTE ─────────────────────────────────────────
+# Cuando tengas saldo_disponible, descomenta y elimina los NaN:
+# df["ratio_monto_saldo"] = df["monto"] / (df["saldo_disponible"] + 1)
+# df["flag_vaciado"]      = (df["ratio_monto_saldo"] > 0.85).astype(int)
+df["ratio_monto_saldo"] = np.nan
+df["flag_vaciado"]      = 0
+
+# ── 3.4 Banco destino de riesgo ───────────────────────────────────────────────
+df["flag_dest_riesgo"] = (
+    df["banco_destino"].str.upper().str.contains(BANCO_RIESGO, na=False)
+).astype(int)
+
+# ── 3.5 Primera vez que cliente transfiere a esta cuenta destino ──────────────
+df["es_primera_vez_destino"] = (
+    ~df.duplicated(subset=["cliente_id", "cuenta_destino"], keep="first")
+).astype(int)
+
+# ── 3.6 Cuentas mula — cuántos clientes distintos recibió esa cuenta ─────────
+receptores = (
+    df.groupby("cuenta_destino")
+      .agg(
+          n_clientes_a_cuenta_destino = ("cliente_id", "nunique"),
+          monto_total_recibido_cuenta = ("monto", "sum"),
+      )
+      .reset_index()
+)
+df = df.merge(receptores, on="cuenta_destino", how="left")
+
+# ── 3.7 Ventanas de velocidad rolling ────────────────────────────────────────
+# Usamos índice datetime por cliente para rolling temporal
+ventanas = {
+    "3min": "3min",
+    "5min": "5min",
+    "1h":   "1h",
+    "12h":  "12h",
+    "24h":  "24h",
+}
+
+# Guardamos índice original para reordenar al final
+df["_idx_orig"] = df.index
+
+for nombre, ventana in ventanas.items():
+    print(f"  Calculando ventana {nombre}...")
+    resultado = []
+    for cliente, grupo in df.groupby("cliente_id"):
+        g = grupo.set_index("datetime_trx").sort_index()
+        roll = g["monto"].rolling(window=ventana, min_periods=1)
+        n_trx    = roll.count().astype(int)
+        monto_ac = roll.sum()
+        tmp = pd.DataFrame({
+            "_idx_orig":          g["_idx_orig"].values,
+            f"n_trx_{nombre}":    n_trx.values,
+            f"monto_acum_{nombre}": monto_ac.values,
+        })
+        resultado.append(tmp)
+
+    res_df = pd.concat(resultado).set_index("_idx_orig")
+    df = df.set_index("_idx_orig").join(res_df).reset_index(drop=True)
+
+print("  ✓ Ventanas rolling construidas")
+
+# ── 3.8 Ratio monto vs promedio del segmento ──────────────────────────────────
+avg_seg = df.groupby("segmento")["monto"].mean().rename("avg_monto_segmento")
+df = df.join(avg_seg, on="segmento")
+df["ratio_monto_vs_segmento"] = df["monto"] / (df["avg_monto_segmento"] + 1)
+
+# ── 3.9 Método de autenticación — PENDIENTE ───────────────────────────────────
+# Cuando tengas nombre_comercio, descomenta:
+# df["codigo_auth"] = df["nombre_comercio"].str[-2:]
+# MAPA_AUTH = {"PN": "Push Notification", "TI": "Touch ID",
+#              "FI": "Face ID", "SM": "SMS", "EM": "Email"}
+# df["tipo_auth"]      = df["codigo_auth"].map(MAPA_AUTH).fillna("Desconocido")
+# df["flag_auth_debil"] = df["codigo_auth"].isin(["SM", "EM", ""]).astype(int)
+
+# ── 3.10 Features compuestas ──────────────────────────────────────────────────
+df["flag_rafaga_dest_riesgo"] = (
+    (df["n_trx_5min"] >= 2) & (df["flag_dest_riesgo"] == 1)
+).astype(int)
+
+df["flag_alto_riesgo"] = (
+    (df["n_trx_5min"] >= 2) &
+    (df["flag_nocturno"] == 1) &
+    (df["flag_dest_riesgo"] == 1)
+).astype(int)
+
+# Pendiente saldo:
+df["flag_vaciado_cuenta_nueva"] = 0
+# df["flag_vaciado_cuenta_nueva"] = (
+#     (df["flag_vaciado"] == 1) & (df["es_primera_vez_destino"] == 1)
+# ).astype(int)
+
+print(f"  ✓ Todas las features construidas — {df.shape[1]} columnas totales")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 4. DISCRIMINACIÓN DE FEATURES BINARIAS
+# ──────────────────────────────────────────────────────────────────────────────
+
+print("\n" + "="*70)
+print("4. DISCRIMINACIÓN DE FEATURES BINARIAS")
+print("   Lift > 1  →  concentra más fraude que el promedio global")
+print("   Lift = 3  →  3x más probable que sea fraude cuando flag = 1")
+print("="*70)
+
+flags = [
+    "flag_nocturno",
+    "flag_fin_semana",
+    "flag_dest_riesgo",
+    "es_primera_vez_destino",
+    "flag_rafaga_dest_riesgo",
+    "flag_alto_riesgo",
+    # "flag_vaciado",               # pendiente saldo
+    # "flag_vaciado_cuenta_nueva",  # pendiente saldo
+    # "flag_auth_debil",            # pendiente nombre_comercio
+]
+
+filas_disc = []
+for flag in flags:
+    if flag not in df.columns:
+        continue
+    grp = df.groupby(flag).agg(
+        n_trx        = ("es_fraude", "count"),
+        n_fraudes    = ("es_fraude", "sum"),
+        fraud_rate   = ("es_fraude", "mean"),
+        monto_fraude = ("monto", lambda x: x[df.loc[x.index, "es_fraude"] == 1].sum()),
+    ).reset_index()
+
+    f1 = grp[grp[flag] == 1]
+    f0 = grp[grp[flag] == 0]
+    if f1.empty or f0.empty:
+        continue
+
+    fr1 = f1["fraud_rate"].values[0]
+    fr0 = f0["fraud_rate"].values[0]
+    filas_disc.append({
+        "feature":              flag,
+        "fraud_rate_flag1_%":   round(fr1 * 100, 3),
+        "fraud_rate_flag0_%":   round(fr0 * 100, 3),
+        "lift":                 round(fr1 / (fr0 + 1e-10), 2),
+        "n_trx_alertadas":      int(f1["n_trx"].values[0]),
+        "fraudes_capturados":   int(f1["n_fraudes"].values[0]),
+        "monto_fraude_cap_S/":  round(f1["monto_fraude"].values[0], 0),
+    })
+
+disc_df = pd.DataFrame(filas_disc).sort_values("lift", ascending=False)
+print(disc_df.to_string(index=False))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 5. TABLA DE UMBRALES DE MONTO
+# ──────────────────────────────────────────────────────────────────────────────
+
+print("\n" + "="*70)
+print("5. TABLA DE UMBRALES DE MONTO")
+print("   Si activo el control para trx con monto >= umbral:")
+print("   ¿qué % de fraude capturo y qué % de normales afecto?")
+print("="*70)
+
+total_normales = total_trx - total_fraudes
+
+filas_u = []
+for u in UMBRALES:
+    sub  = df[df["monto"] >= u]
+    nf   = sub["es_fraude"].sum()
+    nn   = len(sub) - nf
+    mc   = sub.loc[sub["es_fraude"] == 1, "monto"].sum()
+    filas_u.append({
+        "umbral_S/":            u,
+        "fraudes_capturados":   int(nf),
+        "recall_fraude_%":      round(nf / (total_fraudes + 1e-10) * 100, 1),
+        "monto_fraude_cap_S/":  round(mc, 0),
+        "pct_monto_fraude_%":   round(mc / monto_fraude_total * 100, 1),
+        "normales_afectados":   int(nn),
+        "pct_normales_afect_%": round(nn / (total_normales + 1e-10) * 100, 1),
+        "precision_%":          round(nf / (len(sub) + 1e-10) * 100, 2),
+    })
+
+tabla_umbrales = pd.DataFrame(filas_u)
+print(tabla_umbrales.to_string(index=False))
+print(f"\n  Referencia — Total fraudes  : {total_fraudes:,}")
+print(f"  Referencia — Total normales : {total_normales:,}")
+print(f"  Referencia — Monto fraude   : S/ {monto_fraude_total:,.0f}")
+
+# ── 5b. Umbral combinado: monto >= X AND banco destino riesgo ─────────────────
+print("\n── UMBRALES COMBINADOS: monto >= X  AND  banco destino riesgo ───────")
+print("   Más quirúrgico — solo afecta trx hacia el banco de riesgo\n")
+
+filas_uc = []
+for u in UMBRALES:
+    sub = df[(df["monto"] >= u) & (df["flag_dest_riesgo"] == 1)]
+    if len(sub) == 0:
+        continue
+    nf = sub["es_fraude"].sum()
+    nn = len(sub) - nf
+    mc = sub.loc[sub["es_fraude"] == 1, "monto"].sum()
+    filas_uc.append({
+        "umbral_S/":            u,
+        "fraudes_capturados":   int(nf),
+        "recall_fraude_%":      round(nf / (total_fraudes + 1e-10) * 100, 1),
+        "monto_fraude_cap_S/":  round(mc, 0),
+        "normales_afectados":   int(nn),
+        "precision_%":          round(nf / (len(sub) + 1e-10) * 100, 2),
+    })
+
+tabla_uc = pd.DataFrame(filas_uc)
+print(tabla_uc.to_string(index=False))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 6. EVALUACIÓN DE REGLAS DE CONTROL
+# ──────────────────────────────────────────────────────────────────────────────
+
+print("\n" + "="*70)
+print("6. EVALUACIÓN DE REGLAS DE CONTROL")
+print("="*70)
+
+def evaluar_regla(df, nombre, mascara):
+    tp      = int(( mascara & (df["es_fraude"] == 1)).sum())
+    fp      = int(( mascara & (df["es_fraude"] == 0)).sum())
+    total_f = int(df["es_fraude"].sum())
+    total_a = tp + fp
+    prec    = tp / (total_a  + 1e-10)
+    rec     = tp / (total_f  + 1e-10)
+    f1      = 2 * prec * rec / (prec + rec + 1e-10)
+    monto_c = df.loc[mascara & (df["es_fraude"] == 1), "monto"].sum()
+    monto_tf= df.loc[df["es_fraude"] == 1, "monto"].sum()
+    print(f"\n  {'─'*55}")
+    print(f"  Regla    : {nombre}")
+    print(f"  Alertas  : {total_a:,}  ({total_a/len(df)*100:.1f}% del universo)")
+    print(f"  Recall   : {rec*100:.1f}%  ({tp:,} de {total_f:,} fraudes capturados)")
+    print(f"  Precision: {prec*100:.1f}%  |  F1: {f1:.3f}")
+    print(f"  FP (normales afectados) : {fp:,}")
+    print(f"  Monto fraude capturado  : S/ {monto_c:,.0f}  ({monto_c/monto_tf*100:.1f}% del total)")
+
+evaluar_regla(df, "R1 — Banco destino riesgo",
+    df["flag_dest_riesgo"] == 1)
+
+evaluar_regla(df, "R2 — Rafaga >= 2 trx en 5 min",
+    df["n_trx_5min"] >= 2)
+
+evaluar_regla(df, "R3 — Banco riesgo + primera vez a esa cuenta",
+    (df["flag_dest_riesgo"] == 1) & (df["es_primera_vez_destino"] == 1))
+
+evaluar_regla(df, "R4 — Rafaga 5min + banco riesgo",
+    df["flag_rafaga_dest_riesgo"] == 1)
+
+evaluar_regla(df, "R5 — Triple señal (rafaga + nocturno + banco riesgo)",
+    df["flag_alto_riesgo"] == 1)
+
+evaluar_regla(df, "R6 — OR combinado: R3 + R4",
+    ((df["flag_dest_riesgo"] == 1) & (df["es_primera_vez_destino"] == 1)) |
+    (df["flag_rafaga_dest_riesgo"] == 1))
+
+# Pendientes cuando tengas saldo:
+# evaluar_regla(df, "R — Ratio monto/saldo > 85%",
+#     df["ratio_monto_saldo"] > 0.85)
+# evaluar_regla(df, "R — Vaciado + primera vez",
+#     df["flag_vaciado_cuenta_nueva"] == 1)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 7. CUENTAS MULA — RANKING
+# ──────────────────────────────────────────────────────────────────────────────
+
+print("\n" + "="*70)
+print("7. CUENTAS MULA — TOP 20 CUENTAS DESTINO SOSPECHOSAS")
+print("   Reciben dinero de multiples clientes distintos en el mes")
+print("="*70)
+
+cuentas_mula = (
+    df.groupby(["cuenta_destino", "banco_destino"])
+      .agg(
+          n_clientes_distintos = ("cliente_id", "nunique"),
+          n_trx_recibidas      = ("monto", "count"),
+          monto_total_recibido = ("monto", "sum"),
+          n_fraudes_asociados  = ("es_fraude", "sum"),
+          fraud_rate           = ("es_fraude", "mean"),
+      )
+      .reset_index()
+      .query("n_clientes_distintos >= 2")
+      .sort_values("n_clientes_distintos", ascending=False)
+      .head(20)
+)
+cuentas_mula["fraud_rate"] = cuentas_mula["fraud_rate"].round(4)
+print(cuentas_mula.to_string(index=False))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 8. EXPORTAR
+# ──────────────────────────────────────────────────────────────────────────────
+
+print("\n" + "="*70)
+print("8. EXPORTANDO RESULTADOS")
+print("="*70)
+
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+df.to_parquet(OUTPUT_DIR / "8750_marzo_features.parquet", index=False)
+tabla_umbrales.to_csv(OUTPUT_DIR / "tabla_umbrales_monto.csv", index=False)
+tabla_uc.to_csv(OUTPUT_DIR / "tabla_umbrales_combinados.csv", index=False)
+cuentas_mula.to_csv(OUTPUT_DIR / "cuentas_mula_sospechosas.csv", index=False)
+
+print(f"\n  Exportado a: {OUTPUT_DIR}")
+print("  - 8750_marzo_features.parquet")
+print("  - tabla_umbrales_monto.csv")
+print("  - tabla_umbrales_combinados.csv")
+print("  - cuentas_mula_sospechosas.csv")
+print("\n" + "="*70)
+print("FIN DEL ANALISIS")
+print("="*70)
