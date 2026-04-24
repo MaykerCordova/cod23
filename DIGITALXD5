@@ -189,35 +189,42 @@ receptores = (
 )
 df = df.join(receptores, on="cuenta_destino", how="left")
 
-# ── 3.7 Ventanas de velocidad rolling (sintaxis Polars 1.x) ──────────────────
-# rolling_sum_by usa directamente la columna datetime como índice temporal
+# ── 3.7 Ventanas de velocidad rolling (Polars 1.x — sin nulls) ───────────────
 ventanas = {
-    "3min": "3m",
-    "5min": "5m",
-    "1h":   "1h",
-    "12h":  "12h",
-    "24h":  "24h",
+    "3min": 3  * 60,
+    "5min": 5  * 60,
+    "1h":   1  * 3600,
+    "12h":  12 * 3600,
+    "24h":  24 * 3600,
 }
 
-for nombre, ventana in ventanas.items():
-    df = (
-        df.lazy()
-          .sort(["cliente_id", "datetime_trx"])
-          .with_columns([
-              # Monto acumulado en la ventana
-              pl.col("monto")
-                .rolling_sum_by("datetime_trx", window_size=ventana)
-                .over("cliente_id")
-                .alias(f"monto_acum_{nombre}"),
-              # Conteo: suma de unos en la ventana
-              pl.lit(1).cast(pl.Float64)
-                .rolling_sum_by("datetime_trx", window_size=ventana)
-                .over("cliente_id")
-                .cast(pl.Int32)
-                .alias(f"n_trx_{nombre}"),
+# Crear columna de segundos desde epoch para el join por rango
+df = df.with_columns(
+    pl.col("datetime_trx").dt.total_seconds().alias("ts_seg")
+)
+
+for nombre, seg in ventanas.items():
+    # Self-join por rango: para cada trx, busca todas las del mismo cliente
+    # en los últimos N segundos
+    resultado = (
+        df.select(["cliente_id", "ts_seg", "monto"])
+          .join_where(
+              df.select([
+                  pl.col("cliente_id").alias("cliente_id_r"),
+                  pl.col("ts_seg").alias("ts_seg_r"),
+                  pl.col("monto").alias("monto_r"),
+              ]),
+              pl.col("cliente_id") == pl.col("cliente_id_r"),
+              pl.col("ts_seg_r") <= pl.col("ts_seg"),
+              pl.col("ts_seg_r") >  pl.col("ts_seg") - seg,
+          )
+          .group_by(["cliente_id", "ts_seg"])
+          .agg([
+              pl.len().cast(pl.Int32).alias(f"n_trx_{nombre}"),
+              pl.col("monto_r").sum().alias(f"monto_acum_{nombre}"),
           ])
-          .collect()
     )
+    df = df.join(resultado, on=["cliente_id", "ts_seg"], how="left")
 
 print("  ✓ Ventanas rolling construidas")
 
