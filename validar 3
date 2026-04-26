@@ -1,0 +1,23 @@
+import pandas as pd
+from pathlib import Path
+
+carpeta = Path(r"C:\Users\s4930359\Data_Herramientas\BBDD_VRM")
+
+archivos = [
+    "Consolidado.xlsx",
+    "Consolidado_V2.xlsx",
+    "Consolidado_V3.xlsx",
+    "Consolidado_V4.xlsx",
+]
+
+for archivo in archivos:
+    ruta = carpeta / archivo
+    try:
+        # Leer sin header para ver las primeras filas crudas
+        df = pd.read_excel(ruta, header=None, nrows=10)
+        print(f"\n{'='*60}")
+        print(f"{archivo}: {df.shape[1]} columnas detectadas")
+        print(f"Primeras 6 filas:")
+        print(df.iloc[:6, :5])  # primeras 6 filas, primeras 5 columnas
+    except Exception as e:
+        print(f"\n{archivo}: ERROR - {e}")
