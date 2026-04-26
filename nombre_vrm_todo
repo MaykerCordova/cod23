@@ -1,0 +1,19 @@
+import pandas as pd
+
+archivos = {
+    "Consolidado": r"C:\Users\s4930359\Data_Herramientas\BBDD_VRM\Consolidado.xlsx",
+    "VRM_2": r"C:\Users\s4930359\Data_Herramientas\BBDD_VRM\vrm_2.xlsx",
+    "VRM_3": r"C:\Users\s4930359\Data_Herramientas\BBDD_VRM\vrm_3.xlsx",
+    "VRM_4": r"C:\Users\s4930359\Data_Herramientas\BBDD_VRM\vrm_4.xlsx",
+}
+
+for nombre, ruta in archivos.items():
+    try:
+        df = pd.read_excel(ruta, nrows=2)
+        print(f"\n{'='*60}")
+        print(f"{nombre}: {len(df.columns)} columnas")
+        print(f"Columnas:")
+        for i, col in enumerate(df.columns):
+            print(f"  {i}: {col}")
+    except Exception as e:
+        print(f"\n{nombre}: ERROR - {e}")
