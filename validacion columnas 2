@@ -1,0 +1,43 @@
+import pandas as pd
+from pathlib import Path
+
+carpeta = Path(r"C:\Users\s4930359\Data_Herramientas\BBDD_VRM")
+
+archivos = [
+    "Consolidado.xlsx",
+    "Consolidado_V2.xlsx",
+    "Consolidado_V3.xlsx",
+    "Consolidado_V4.xlsx",
+]
+
+dfs = {}
+for archivo in archivos:
+    ruta = carpeta / archivo
+    try:
+        df = pd.read_excel(ruta, nrows=3)
+        dfs[archivo] = set(df.columns)
+        print(f"\n{archivo}: {len(df.columns)} columnas")
+        print(f"Columnas: {list(df.columns)}")
+    except Exception as e:
+        print(f"\n{archivo}: ERROR - {e}")
+
+# Comparar
+print(f"\n{'='*60}")
+print("COMPARACION DE COLUMNAS")
+print(f"{'='*60}")
+
+ref_name = archivos[0]
+ref_cols = dfs.get(ref_name, set())
+
+for archivo, cols in dfs.items():
+    if archivo == ref_name:
+        continue
+    nuevas = cols - ref_cols
+    faltantes = ref_cols - cols
+    print(f"\n{archivo} vs {ref_name}:")
+    if nuevas:
+        print(f"  Columnas NUEVAS: {nuevas}")
+    if faltantes:
+        print(f"  Columnas FALTANTES: {faltantes}")
+    if not nuevas and not faltantes:
+        print(f"  Columnas identicas")
