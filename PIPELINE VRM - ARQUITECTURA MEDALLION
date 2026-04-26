@@ -357,7 +357,6 @@ class VRMTransformer:
         """
         Transforma consolidado histórico (Excel) al schema Silver.
         Los consolidados ya tienen nombres procesados por Marcial.
-        Solo necesita: tipar datos, generar columnas derivadas si faltan.
         """
         print("\n--- TRANSFORMACION SILVER (HISTORICO) ---")
 
@@ -377,6 +376,28 @@ class VRMTransformer:
             df = df.with_columns(
                 pl.col("MONTO USD").cast(pl.Float64, strict=False).alias("MONTO USD")
             )
+
+        # Castear TODAS las demás columnas a Utf8 para evitar conflictos de tipo al concatenar
+        # EXCEPTO las que deben ser numéricas
+        COLUMNAS_NUMERICAS = {
+            "Fecha", "MONTO USD", "SCORE", "VCAS Score", "VAAI Score",
+            "Acquirer Transaction Amount", "Cashback Amount", "Issuer Amount",
+            "Aggregate Transaction Amount", "Transaction Amount Difference",
+            "Token Age", "Token Transaction Counter", "Token Transaction Last Counter",
+            "Token Transaction Elapsed Time", "VCAS VCAS Device ID Velocity Count",
+            "VCAS VCAS Device IP-Address Velocity Count",
+        }
+
+        for col in df.columns:
+            if col in COLUMNAS_NUMERICAS:
+                if col != "Fecha":
+                    df = df.with_columns(
+                        pl.col(col).cast(pl.Float64, strict=False).alias(col)
+                    )
+            elif df[col].dtype != pl.Utf8:
+                df = df.with_columns(
+                    pl.col(col).cast(pl.Utf8, strict=False).alias(col)
+                )
 
         # Generar columnas derivadas si no existen
         df = cls._aplicar_reglas_negocio(df)
