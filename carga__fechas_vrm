@@ -1,0 +1,30 @@
+from vrm_pipeline_medallion import run_daily
+from pathlib import Path
+
+bronze = Path(r"C:\Users\s4930359\Data_Herramientas\data\bronze\vrm")
+
+# Obtener las fechas únicas (carpetas)
+fechas = sorted(set(f.parent.name for f in bronze.rglob("*.csv")))
+
+for fecha_folder in fechas:
+    # Buscar lista1 y lista2 de cada fecha
+    carpeta = list(bronze.rglob(f"*/{fecha_folder}"))
+    if not carpeta:
+        continue
+    carpeta = carpeta[0]
+    
+    csvs = sorted(carpeta.glob("*.csv"))
+    if len(csvs) < 2:
+        print(f"WARN: {fecha_folder} tiene menos de 2 archivos, saltando...")
+        continue
+    
+    lista1 = str(csvs[0])
+    lista2 = str(csvs[1])
+    
+    # Construir fecha en formato YYYY-MM-DD desde la estructura de carpetas
+    parts = carpeta.parts
+    fecha = f"{parts[-3]}-{parts[-2]}-{parts[-1]}"
+    
+    print(f"\n{'='*60}")
+    print(f"Cargando: {fecha}")
+    run_daily(lista1_path=lista1, lista2_path=lista2, fecha_descarga=fecha)
