@@ -1,0 +1,11 @@
+import pandas as pd
+
+df = pd.read_excel(
+    r"C:\Users\s4930359\Data_Herramientas\BBDD_VRM\Consolidado_V2.xlsx",
+    header=None,
+    nrows=120
+)
+
+print(f"Shape: {df.shape}")
+print(f"\nPrimeras 120 filas, columna 0:")
+print(df[0].to_list())
