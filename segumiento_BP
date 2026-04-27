@@ -165,10 +165,9 @@ def extract_emails() -> pd.DataFrame:
             if sent_on <= fecha_rec:
                 continue
 
-            # Condición 2: no debe ser el remitente original respondiendo
-            # (descartamos sus acotaciones adicionales)
-            if sender_respuesta == remitente_orig:
-                continue
+            # NOTA: filtro de remitente desactivado para pruebas con auto-envío
+            # En producción (buzón de la jefa) reactivar esta línea:
+            # if sender_respuesta == remitente_orig: continue
 
             entry = {
                 "sent_on": sent_on,
