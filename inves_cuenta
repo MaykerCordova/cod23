@@ -1,0 +1,102 @@
+# ── ANÁLISIS FORENSE DE CUENTAS SOSPECHOSAS ──────────────────────────────────
+
+# Las dos cuentas top de Interbank que identificamos
+CUENTAS_INVESTIGAR = [
+    "0032000003001399954137",  # 373 clientes, S/2.6M
+    "0032000003001399956732",  # 330 clientes, S/3.4M
+]
+
+for cuenta in CUENTAS_INVESTIGAR:
+    df_cuenta = df.filter(pl.col('cuenta_destino') == cuenta)
+    
+    print(f"\n{'='*65}")
+    print(f"CUENTA: {cuenta}")
+    print(f"Banco: {df_cuenta['banco_destino'][0]}")
+    print(f"{'='*65}")
+    
+    # ── Resumen ejecutivo ─────────────────────────────────────────
+    print(f"\nRESUMEN:")
+    print(f"  Clientes distintos que enviaron : {df_cuenta['cliente_id'].n_unique():,}")
+    print(f"  Total transacciones             : {df_cuenta.shape[0]:,}")
+    print(f"  Monto total recibido            : S/ {df_cuenta['monto'].sum():,.2f}")
+    print(f"  Monto promedio por trx          : S/ {df_cuenta['monto'].mean():,.2f}")
+    print(f"  Monto mediana                   : S/ {df_cuenta['monto'].median():,.2f}")
+    print(f"  Monto mínimo                    : S/ {df_cuenta['monto'].min():,.2f}")
+    print(f"  Monto máximo                    : S/ {df_cuenta['monto'].max():,.2f}")
+    print(f"  Desviación estándar monto       : S/ {df_cuenta['monto'].std():,.2f}")
+    print(f"  Coef. variación monto           : {df_cuenta['monto'].std()/df_cuenta['monto'].mean()*100:.1f}%")
+    print(f"  Fraudes asociados               : {df_cuenta['es_fraude'].sum()}")
+    
+    # ── Distribución de montos por rangos ─────────────────────────
+    print(f"\nDISTRIBUCIÓN DE MONTOS:")
+    df_cuenta_pd = df_cuenta.to_pandas()
+    bins   = [0,500,1000,2000,3000,5000,10000,20000,999999]
+    labels = ['<500','500-1k','1k-2k','2k-3k','3k-5k','5k-10k','10k-20k','>20k']
+    df_cuenta_pd['rango'] = pd.cut(df_cuenta_pd['monto'], bins=bins, labels=labels)
+    dist_monto = df_cuenta_pd.groupby('rango', observed=True).agg(
+        n_trx=('monto','count'),
+        monto_total=('monto','sum'),
+        pct=('monto', lambda x: len(x)/len(df_cuenta_pd)*100)
+    ).reset_index()
+    print(dist_monto.to_string(index=False))
+    
+    # ── Método de autenticación usado ─────────────────────────────
+    if 'tipo_auth' in df_cuenta.columns:
+        print(f"\nMÉTODO DE AUTENTICACIÓN:")
+        print(df_cuenta.group_by('tipo_auth').agg([
+            pl.len().alias('n_trx'),
+            pl.col('monto').mean().round(0).alias('monto_prom'),
+        ]).sort('n_trx', descending=True))
+    
+    # ── IPs únicas que originaron transferencias ───────────────────
+    if 'ip_terminal' in df_cuenta.columns:
+        n_ips = df_cuenta['ip_terminal'].n_unique()
+        print(f"\nIPs distintas de origen : {n_ips:,}")
+        print(f"Trx por IP (promedio)   : {df_cuenta.shape[0]/n_ips:.1f}")
+        print("\nTop 5 IPs con más transferencias a esta cuenta:")
+        print(df_cuenta.group_by('ip_terminal').agg([
+            pl.len().alias('n_trx'),
+            pl.col('cliente_id').n_unique().alias('n_clientes'),
+            pl.col('monto').sum().alias('monto_total'),
+        ]).sort('n_trx', descending=True).head(5))
+    
+    # ── Dispositivos hash ─────────────────────────────────────────
+    if 'hash_dispositivo' in df_cuenta.columns:
+        n_hash = df_cuenta['hash_dispositivo'].n_unique()
+        print(f"\nDispositivos hash distintos: {n_hash:,}")
+    
+    # ── Evolución diaria — ¿cuándo arrancó la actividad? ──────────
+    print(f"\nEVOLUCIÓN DIARIA (actividad por día):")
+    evol = (
+        df_cuenta.with_columns(
+            pl.col('datetime_trx').dt.date().alias('fecha')
+        )
+        .group_by('fecha')
+        .agg([
+            pl.len().alias('n_trx'),
+            pl.col('cliente_id').n_unique().alias('n_clientes'),
+            pl.col('monto').sum().alias('monto_dia'),
+        ])
+        .sort('fecha')
+    )
+    print(evol)
+    
+    # ── Segmentos de clientes que enviaron ────────────────────────
+    if 'segmento' in df_cuenta.columns:
+        print(f"\nSEGMENTOS DE CLIENTES QUE ENVIARON:")
+        print(df_cuenta.group_by('segmento').agg([
+            pl.col('cliente_id').n_unique().alias('n_clientes'),
+            pl.len().alias('n_trx'),
+            pl.col('monto').sum().alias('monto_total'),
+        ]).sort('n_clientes', descending=True))
+    
+    # ── Detalle de las 20 transacciones más grandes ───────────────
+    print(f"\nTOP 20 TRANSACCIONES MÁS GRANDES A ESTA CUENTA:")
+    cols_mostrar = ['datetime_trx','cliente_id','monto','tipo_auth',
+                    'ip_terminal','hash_dispositivo','segmento','es_fraude']
+    cols_disponibles = [c for c in cols_mostrar if c in df_cuenta.columns]
+    print(
+        df_cuenta.select(cols_disponibles)
+                 .sort('monto', descending=True)
+                 .head(20)
+    )
