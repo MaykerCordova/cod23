@@ -1,0 +1,419 @@
+"""
+Pipeline: Seguimiento de correos BANCA PRIVADA
+Buzón: Prevención de Fraudes (Outlook Desktop)
+Output: histórico incremental en Excel (.xlsx)
+
+Requisitos:
+    pip install pywin32 openpyxl pandas
+"""
+
+import win32com.client
+import pandas as pd
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+from pathlib import Path
+from datetime import datetime, timezone
+import hashlib
+
+# ─────────────────────────────────────────────
+# CONFIGURACIÓN
+# ─────────────────────────────────────────────
+OUTPUT_PATH = Path(r"C:\Users\s4930359\Data_Herramientas\data\Gold\banca_privada_seguimiento.xlsx")
+KEYWORD     = "BANCA PRIVADA"          # búsqueda case-insensitive
+SHEET_NAME  = "Seguimiento"
+
+
+# ─────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────
+def safe_datetime(dt_obj):
+    """Convierte COM datetime a datetime Python naive (local)."""
+    if dt_obj is None:
+        return None
+    try:
+        # pywintypes.datetime → isoformat → pd.Timestamp
+        return pd.Timestamp(str(dt_obj)).to_pydatetime().replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+def make_uid(subject: str, received: datetime) -> str:
+    """Hash SHA-256 truncado para deduplicar sin depender de EntryID."""
+    raw = f"{subject}|{received}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def get_folder(namespace, folder_name: str):
+    """
+    Busca una carpeta por nombre dentro del buzón por defecto.
+    Soporta subcarpetas (ej. 'Bandeja de entrada/BANCA PRIVADA').
+    """
+    inbox = namespace.GetDefaultFolder(6)   # olFolderInbox = 6
+
+    if "/" in folder_name:
+        parts = folder_name.split("/")
+        folder = inbox
+        for part in parts:
+            folder = folder.Folders[part]
+        return folder
+
+    # Búsqueda directa en primer nivel
+    for folder in inbox.Folders:
+        if folder.Name.upper() == folder_name.upper():
+            return folder
+
+    # Si no está dentro de Inbox, buscar en el buzón raíz
+    root = namespace.Folders.Item(1)
+    for folder in root.Folders:
+        if folder.Name.upper() == folder_name.upper():
+            return folder
+
+    raise ValueError(f"Carpeta '{folder_name}' no encontrada.")
+
+
+# ─────────────────────────────────────────────
+# EXTRACCIÓN
+# ─────────────────────────────────────────────
+def extract_emails() -> pd.DataFrame:
+    """
+    Lógica:
+      - Por cada ConversationID con KEYWORD en el asunto:
+          · fecha_recepcion  = el PRIMER correo recibido en esa conversación
+          · fecha_respuesta  = la PRIMERA respuesta enviada por el equipo
+                               (posterior a fecha_recepcion, ignorando
+                                respuestas del remitente original)
+      - Una sola fila por conversación en el output.
+    """
+    outlook   = win32com.client.Dispatch("Outlook.Application")
+    namespace = outlook.GetNamespace("MAPI")
+
+    # ── Paso 1: recopilar TODOS los correos recibidos con KEYWORD ─────
+    # Estructura: conv_id → lista de (received_dt, subject, sender, entry_id)
+    conv_recibidos: dict = {}
+
+    try:
+        bp_folder = get_folder(namespace, "BANCA PRIVADA")
+    except ValueError:
+        bp_folder = namespace.GetDefaultFolder(6)
+        print("[INFO] Carpeta 'BANCA PRIVADA' no encontrada; filtrando desde Inbox.")
+
+    for mail in bp_folder.Items:
+        try:
+            subject = getattr(mail, "Subject", "") or ""
+            if KEYWORD.lower() not in subject.lower():
+                continue
+
+            conv_id  = getattr(mail, "ConversationID", "") or ""
+            received = safe_datetime(getattr(mail, "ReceivedTime", None))
+            if not conv_id or not received:
+                continue
+
+            entry = {
+                "received": received,
+                "subject":  subject,
+                "sender":   getattr(mail, "SenderEmailAddress", ""),
+                "entry_id": getattr(mail, "EntryID", ""),
+            }
+            conv_recibidos.setdefault(conv_id, []).append(entry)
+
+        except Exception as e:
+            print(f"[WARN] Error leyendo recibido: {e}")
+
+    if not conv_recibidos:
+        print("[INFO] No se encontraron correos con el keyword.")
+        return pd.DataFrame()
+
+    # Por cada conversación: quedarse con el PRIMER correo recibido
+    primeros: dict = {}   # conv_id → dict con datos del primer recibido
+    for conv_id, items in conv_recibidos.items():
+        primer = min(items, key=lambda x: x["received"])
+        primeros[conv_id] = {
+            "conv_id":         conv_id,
+            "uid":             make_uid(primer["subject"], primer["received"]),
+            "asunto":          primer["subject"],
+            "remitente":       primer["sender"],
+            "fecha_recepcion": primer["received"],
+            "fecha_respuesta": None,
+            "tiempo_respuesta_horas": None,
+            "respondido_por":  None,
+        }
+
+    # ── Paso 2: recopilar TODAS las respuestas enviadas ───────────────
+    # Estructura: conv_id → lista de (sent_dt, sender_email)
+    # Solo incluimos correos enviados DESPUÉS de la fecha del primer recibido
+    # y cuyo remitente NO sea el mismo que envió el correo original
+    conv_respuestas: dict = {}
+
+    sent_folder = namespace.GetDefaultFolder(5)  # olFolderSentMail = 5
+
+    for mail in sent_folder.Items:
+        try:
+            conv_id = getattr(mail, "ConversationID", "") or ""
+            if conv_id not in primeros:
+                continue
+
+            sent_on = safe_datetime(getattr(mail, "SentOn", None))
+            if not sent_on:
+                continue
+
+            fecha_rec       = primeros[conv_id]["fecha_recepcion"]
+            remitente_orig  = primeros[conv_id]["remitente"].lower().strip()
+            sender_respuesta = getattr(mail, "SenderEmailAddress", "").lower().strip()
+
+            # Condición 1: la respuesta debe ser posterior al primer recibido
+            if sent_on <= fecha_rec:
+                continue
+
+            # Condición 2: no debe ser el remitente original respondiendo
+            # (descartamos sus acotaciones adicionales)
+            if sender_respuesta == remitente_orig:
+                continue
+
+            entry = {
+                "sent_on": sent_on,
+                "sender":  getattr(mail, "SenderEmailAddress", ""),
+            }
+            conv_respuestas.setdefault(conv_id, []).append(entry)
+
+        except Exception as e:
+            print(f"[WARN] Error leyendo enviado: {e}")
+
+    # Por cada conversación: quedarse con la PRIMERA respuesta del equipo
+    for conv_id, respuestas in conv_respuestas.items():
+        primera = min(respuestas, key=lambda x: x["sent_on"])
+        fecha_rec   = primeros[conv_id]["fecha_recepcion"]
+        sent_on     = primera["sent_on"]
+        delta_horas = round((sent_on - fecha_rec).total_seconds() / 3600, 2)
+
+        primeros[conv_id]["fecha_respuesta"]        = sent_on
+        primeros[conv_id]["tiempo_respuesta_horas"] = delta_horas
+        primeros[conv_id]["respondido_por"]         = primera["sender"]
+
+    # ── Paso 3: armar DataFrame final ─────────────────────────────────
+    df = pd.DataFrame(list(primeros.values()))
+    df["fecha_recepcion"] = pd.to_datetime(df["fecha_recepcion"])
+    df["fecha_respuesta"] = pd.to_datetime(df["fecha_respuesta"])
+    df = df.sort_values("fecha_recepcion").reset_index(drop=True)
+
+    sin_resp = df["fecha_respuesta"].isna().sum()
+    print(f"[INFO] Conversaciones encontradas : {len(df)}")
+    print(f"[INFO] Con respuesta              : {len(df) - sin_resp}")
+    print(f"[INFO] Sin respuesta aún          : {sin_resp}")
+
+    return df
+
+
+# ─────────────────────────────────────────────
+# CARGA INCREMENTAL
+# ─────────────────────────────────────────────
+def load_existing_uids(path: Path) -> set:
+    """Lee UIDs ya almacenados para evitar duplicados."""
+    if not path.exists():
+        return set()
+    try:
+        df_existing = pd.read_excel(path, sheet_name=SHEET_NAME, dtype=str)
+        if "uid" in df_existing.columns:
+            return set(df_existing["uid"].dropna().tolist())
+    except Exception:
+        pass
+    return set()
+
+
+def append_to_excel(df_new: pd.DataFrame, path: Path):
+    """
+    Agrega filas nuevas al Excel histórico.
+    Crea el archivo con formato si no existe.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    existing_uids = load_existing_uids(path)
+    df_append = df_new[~df_new["uid"].isin(existing_uids)].copy()
+
+    if df_append.empty:
+        print("[INFO] Sin registros nuevos. Histórico ya actualizado.")
+        return 0
+
+    # Columnas visibles (sin conv_id interno)
+    cols_display = [
+        "uid", "asunto", "remitente",
+        "fecha_recepcion", "fecha_respuesta",
+        "tiempo_respuesta_horas", "respondido_por"
+    ]
+    df_append = df_append[cols_display]
+
+    if path.exists():
+        # Leer existente y concatenar
+        df_hist = pd.read_excel(path, sheet_name=SHEET_NAME)
+        df_final = pd.concat([df_hist, df_append], ignore_index=True)
+    else:
+        df_final = df_append
+
+    _write_excel(df_final, path)
+    print(f"[OK] {len(df_append)} registros nuevos agregados → {path}")
+    return len(df_append)
+
+
+def _write_excel(df: pd.DataFrame, path: Path):
+    """Escribe el DataFrame con formato profesional en openpyxl."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = SHEET_NAME
+
+    # ── Paleta de colores ─────────────────────────────────────────────
+    COLOR_HEADER   = "1F3864"   # azul oscuro Scotiabank
+    COLOR_RECIBIDO = "D9E1F2"   # azul claro
+    COLOR_RESPUESTA= "E2EFDA"   # verde claro
+    COLOR_ALT      = "F2F2F2"   # gris alternado
+
+    # ── Encabezados ───────────────────────────────────────────────────
+    headers = {
+        "uid":                      "UID",
+        "asunto":                   "Asunto",
+        "remitente":                "Remitente (origen)",
+        "fecha_recepcion":          "Fecha Recepción",
+        "fecha_respuesta":          "Primera Respuesta",
+        "tiempo_respuesta_horas":   "Tiempo Respuesta (h)",
+        "respondido_por":           "Respondido Por",
+    }
+
+    col_widths = {
+        "uid": 18, "asunto": 55, "remitente": 35,
+        "fecha_recepcion": 22, "fecha_respuesta": 22,
+        "tiempo_respuesta_horas": 22, "respondido_por": 35,
+    }
+
+    header_font  = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+    header_fill  = PatternFill("solid", start_color=COLOR_HEADER)
+    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    thin_border  = Border(
+        left=Side(style="thin"), right=Side(style="thin"),
+        top=Side(style="thin"), bottom=Side(style="thin")
+    )
+
+    for col_idx, col_key in enumerate(headers, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=headers[col_key])
+        cell.font        = header_font
+        cell.fill        = header_fill
+        cell.alignment   = header_align
+        cell.border      = thin_border
+        ws.column_dimensions[get_column_letter(col_idx)].width = col_widths[col_key]
+
+    ws.row_dimensions[1].height = 30
+
+    # ── Datos ─────────────────────────────────────────────────────────
+    date_fmt  = "DD/MM/YYYY HH:MM"
+    num_align = Alignment(horizontal="center")
+    str_align = Alignment(horizontal="left", wrap_text=True)
+
+    for row_idx, row in enumerate(df.itertuples(index=False), start=2):
+        fecha_resp = getattr(row, "fecha_respuesta", None)
+        tiene_resp = fecha_resp is not None and pd.notna(fecha_resp)
+        # Verde = respondido, Amarillo = pendiente sin respuesta
+        row_color = COLOR_RESPUESTA if tiene_resp else "FFF2CC"
+        row_fill  = PatternFill("solid", start_color=row_color)
+
+        values = [
+            getattr(row, "uid", ""),
+            getattr(row, "asunto", ""),
+            getattr(row, "remitente", ""),
+            getattr(row, "fecha_recepcion", None),
+            getattr(row, "fecha_respuesta", None),
+            getattr(row, "tiempo_respuesta_horas", None),
+            getattr(row, "respondido_por", None),
+        ]
+
+        for col_idx, value in enumerate(values, start=1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            cell.fill   = row_fill
+            cell.border = thin_border
+            cell.font   = Font(name="Arial", size=9)
+
+            col_key = list(headers.keys())[col_idx - 1]
+
+            if col_key in ("fecha_recepcion", "fecha_respuesta"):
+                if isinstance(value, (datetime, pd.Timestamp)) and pd.notna(value):
+                    cell.number_format = date_fmt
+                    cell.alignment = num_align
+            elif col_key == "tiempo_respuesta_horas":
+                cell.number_format = "#,##0.00"
+                cell.alignment = num_align
+            elif col_key == "uid":
+                cell.alignment = num_align
+                cell.font = Font(name="Courier New", size=8)
+            else:
+                cell.alignment = str_align
+
+    # ── Fila de totales ───────────────────────────────────────────────
+    last_row     = ws.max_row
+    total_row    = last_row + 2
+    data_rows    = last_row - 1   # excluye header
+
+    summary_fill = PatternFill("solid", start_color="FFE699")
+    summary_font = Font(name="Arial", bold=True, size=9)
+
+    ws.cell(row=total_row, column=1, value="RESUMEN").font  = summary_font
+    ws.cell(row=total_row, column=1).fill = summary_fill
+
+    # Total de conversaciones
+    ws.cell(row=total_row, column=2,
+            value=f'=COUNTA(A2:A{last_row})').number_format = "0"
+    ws.cell(row=total_row, column=2).font = summary_font
+    ws.cell(row=total_row, column=2).fill = summary_fill
+    ws.cell(row=total_row, column=3,
+            value="Total conversaciones").font = Font(name="Arial", size=9, italic=True)
+    ws.cell(row=total_row, column=3).fill = summary_fill
+
+    # Respondidos (tienen fecha_respuesta en col E)
+    ws.cell(row=total_row + 1, column=2,
+            value=f'=COUNTA(E2:E{last_row})').number_format = "0"
+    ws.cell(row=total_row + 1, column=2).font = summary_font
+    ws.cell(row=total_row + 1, column=2).fill = summary_fill
+    ws.cell(row=total_row + 1, column=3,
+            value="Respondidos").font = Font(name="Arial", size=9, italic=True)
+    ws.cell(row=total_row + 1, column=3).fill = summary_fill
+
+    # Sin respuesta aún
+    ws.cell(row=total_row + 2, column=2,
+            value=f'=COUNTBLANK(E2:E{last_row})').number_format = "0"
+    ws.cell(row=total_row + 2, column=2).font = summary_font
+    ws.cell(row=total_row + 2, column=2).fill = PatternFill("solid", start_color="FFE0E0")
+    ws.cell(row=total_row + 2, column=3,
+            value="Sin respuesta").font = Font(name="Arial", size=9, italic=True)
+    ws.cell(row=total_row + 2, column=3).fill = PatternFill("solid", start_color="FFE0E0")
+
+    # Promedio tiempo respuesta — col F (columna 6)
+    ws.cell(row=total_row + 3, column=2,
+            value=f'=IFERROR(AVERAGE(F2:F{last_row}),"-")')
+    ws.cell(row=total_row + 3, column=2).number_format = "#,##0.00"
+    ws.cell(row=total_row + 3, column=2).font = summary_font
+    ws.cell(row=total_row + 3, column=2).fill = summary_fill
+    ws.cell(row=total_row + 3, column=3,
+            value="Tiempo promedio respuesta (h)").font = Font(name="Arial", size=9, italic=True)
+    ws.cell(row=total_row + 3, column=3).fill = summary_fill
+
+    # ── Freeze panes + autofilter ──────────────────────────────────────
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:G{last_row}"
+
+    wb.save(path)
+
+
+# ─────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────
+def run():
+    print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] Iniciando extracción...")
+    df = extract_emails()
+
+    if df.empty:
+        print("[INFO] No hay datos que procesar.")
+        return
+
+    nuevos = append_to_excel(df, OUTPUT_PATH)
+    print(f"[DONE] Proceso completado. Nuevos registros: {nuevos}")
+    print(f"       Archivo: {OUTPUT_PATH}")
+
+
+if __name__ == "__main__":
+    run()
