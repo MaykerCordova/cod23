@@ -349,6 +349,27 @@ class VRMTransformer:
                 pl.col("MONTO USD").cast(pl.Utf8).str.replace_all(",", "").cast(pl.Float64, strict=False).alias("MONTO USD")
             )
 
+        # Castear columnas numéricas a Float64 y el resto a Utf8 (igual que historico)
+        COLUMNAS_NUMERICAS = {
+            "Fecha", "MONTO USD", "SCORE", "VCAS Score", "VAAI Score",
+            "Acquirer Transaction Amount", "Cashback Amount", "Issuer Amount",
+            "Aggregate Transaction Amount", "Transaction Amount Difference",
+            "Token Age", "Token Transaction Counter", "Token Transaction Last Counter",
+            "Token Transaction Elapsed Time", "VCAS VCAS Device ID Velocity Count",
+            "VCAS VCAS Device IP-Address Velocity Count",
+        }
+
+        for col in df.columns:
+            if col in COLUMNAS_NUMERICAS:
+                if col != "Fecha":
+                    df = df.with_columns(
+                        pl.col(col).cast(pl.Float64, strict=False).alias(col)
+                    )
+            elif df[col].dtype != pl.Utf8:
+                df = df.with_columns(
+                    pl.col(col).cast(pl.Utf8, strict=False).alias(col)
+                )
+
         print(f"  Schema final: {df.shape[1]} columnas, {df.shape[0]:,} filas")
         return df
 
@@ -589,8 +610,20 @@ class SilverLoader:
                     pl.lit(None).cast(df_existing[col].dtype).alias(col)
                 )
 
-        # Asegurar mismo orden
+        # Asegurar mismo orden y mismos tipos de columnas
         df_new = df_new.select(df_existing.columns)
+
+        # Forzar que df_new tenga los mismos tipos que df_existing
+        for col in df_existing.columns:
+            if col in df_new.columns and df_new[col].dtype != df_existing[col].dtype:
+                try:
+                    df_new = df_new.with_columns(
+                        pl.col(col).cast(df_existing[col].dtype, strict=False).alias(col)
+                    )
+                except Exception:
+                    # Si no se puede castear, ambos a Utf8
+                    df_new = df_new.with_columns(pl.col(col).cast(pl.Utf8, strict=False).alias(col))
+                    df_existing = df_existing.with_columns(pl.col(col).cast(pl.Utf8, strict=False).alias(col))
 
         # Append
         df_final = pl.concat([df_existing, df_new], how="diagonal")
