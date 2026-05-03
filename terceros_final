@@ -1,0 +1,103 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# CELDA 1 — Setup ÚNICO al inicio del notebook (instala todo lo necesario)
+# ══════════════════════════════════════════════════════════════════════════════
+import subprocess, sys
+
+PAQUETES = [
+    'polars[all]',       # Polars + extras (xlsx, parquet, etc.)
+    'fastexcel',         # ← motor calamine para Excel ULTRA rápido
+    'itables',           # tablas interactivas estilo DT de R
+    'plotly',            # gráficos interactivos
+    'pyarrow',           # para Parquet
+]
+
+for pkg in PAQUETES:
+    try:
+        __import__(pkg.split('[')[0].replace('-','_'))
+    except ImportError:
+        subprocess.check_call([sys.executable, '-m', 'pip', 'install', pkg, '-q'])
+        print(f'✅ Instalado: {pkg}')
+
+import polars as pl
+import polars.selectors as cs
+from pathlib import Path
+import time
+
+print(f'\n✅ Polars {pl.__version__} listo')
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CELDA 2 — Tablas interactivas estilo DT de R (configuración global)
+# ══════════════════════════════════════════════════════════════════════════════
+from itables import init_notebook_mode, show
+import itables.options as opt
+
+# Activa AUTOMÁTICAMENTE las tablas interactivas para todos los DataFrames
+init_notebook_mode(all_tables=True)
+
+# Configuración global — aplica a todas las tablas del notebook
+opt.lengthMenu = [10, 25, 50, 100, -1]   # -1 = mostrar todas
+opt.classes    = "display nowrap compact hover stripe"
+opt.style      = "table-layout:auto;width:100%;font-size:12px"
+opt.maxBytes   = 0   # sin límite de bytes (para datasets grandes)
+opt.scrollX    = True
+
+print('✅ itables configurado — todas las tablas serán interactivas')
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CELDA 3 — INGESTA RÁPIDA con Polars nativo (motor calamine)
+# ══════════════════════════════════════════════════════════════════════════════
+BASE_DIR = Path(r'C:\Users\s4930359\Data_Herramientas\data\transferencias_terceros')
+
+ARCHIVOS = {
+    'Enero' : BASE_DIR / 'monitor_transferencias_enero.xlsx',
+    'Marzo' : BASE_DIR / 'monitor_transferencias_marzo.xlsx',
+    'Abril' : BASE_DIR / 'monitor_transferencias_abril.xlsx',
+    # 'Mes4' : BASE_DIR / 'monitor_transferencias_mes4.xlsx',
+}
+
+def limpiar_nombre_columna(nombre: str) -> str:
+    """Equivalente a janitor::clean_names(case='all_caps') en R."""
+    import re
+    n = nombre.strip().upper()
+    n = re.sub(r'\s+', '_', n)        # espacios → _
+    n = re.sub(r'-',   '_', n)        # guiones → _
+    n = re.sub(r'[^A-Z0-9_]', '', n)  # elimina caracteres raros
+    return n
+
+def leer_monitor_polars(path: Path, mes: str) -> pl.DataFrame:
+    """
+    Lectura ULTRA rápida usando engine='calamine':
+    - calamine es un parser de Excel escrito en Rust (~10-20× más rápido que openpyxl)
+    - infer_schema_length=0 fuerza todas las columnas como String (= dtype=str de pandas)
+    - read_options con header_row=4 salta las 4 filas de basura del export Monitor
+    """
+    df = pl.read_excel(
+        path,
+        engine        = 'calamine',
+        read_options  = {'header_row': 4},      # equivalente a skiprows=4
+        infer_schema_length = 0,                # todo como String
+    )
+    # Limpiar nombres
+    df = df.rename({c: limpiar_nombre_columna(c) for c in df.columns})
+    # Marca de mes origen
+    return df.with_columns(pl.lit(mes).alias('MES_ORIGEN'))
+
+
+# ── Ejecución con benchmark de tiempo ─────────────────────────────────────────
+t0 = time.time()
+
+frames = [leer_monitor_polars(path, mes) for mes, path in ARCHIVOS.items()]
+raw    = pl.concat(frames, how='diagonal_relaxed')
+
+t1 = time.time()
+
+print(f'⏱️  Tiempo de ingesta: {t1-t0:.2f} segundos')
+print(f'📊 Shape raw: {raw.shape[0]:,} filas × {raw.shape[1]} columnas')
+print(f'💾 Memoria   : {raw.estimated_size("mb"):.1f} MB')
+
+# Vista de las primeras filas — sale como tabla interactiva por itables
+raw.head(5).to_pandas()
