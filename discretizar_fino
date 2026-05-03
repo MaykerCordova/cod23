@@ -1,0 +1,121 @@
+library(rpart)
+library(rpart.plot)
+library(arules)
+library(cowplot)
+
+# ── Datos limpios para discretización ────────────────────────────────────────
+disc <- as.data.frame(df_cal[!is.na(MONTO) & !is.na(FLAG_FRAUDE),
+                              .(MONTO, FLAG_FRAUDE)])
+disc$FLAG_FRAUDE <- factor(disc$FLAG_FRAUDE, 
+                           levels = c(0,1), 
+                           labels = c("No Fraude","Fraude"))
+
+# ══════════════════════════════════════════════════════════════
+# MÉTODO 1 — Boxplot + Cuartiles (como tu clase)
+# ══════════════════════════════════════════════════════════════
+summary(disc$MONTO)
+quantile(disc$MONTO, probs = c(0, 0.25, 0.5, 0.75, 1))
+
+# Boxplot para ver la distribución
+ggplot(disc) + aes(x = " ", y = MONTO) +
+  geom_boxplot(fill = COLOR_ACCENT, alpha = 0.7) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Boxplot de Monto — Transferencias a Terceros",
+       x = NULL, y = "Monto (S/)") -> bp_monto
+print(bp_monto)
+
+# Cortes basados en cuartiles — tú defines según lo que veas
+disc$MONTO_CAT1 <- cut(disc$MONTO,
+                        breaks = c(-Inf, 2000, 5000, 10000, Inf),
+                        labels = c("Bajo (<2K)",
+                                   "Medio (2K-5K)",
+                                   "Alto (5K-10K)",
+                                   "Crítico (>10K)"),
+                        right = FALSE)
+
+table(disc$MONTO_CAT1)
+prop.table(table(disc$MONTO_CAT1, disc$FLAG_FRAUDE), margin = 1)
+
+g1 <- ggplot(disc) + aes(x = MONTO_CAT1, fill = FLAG_FRAUDE) +
+  geom_bar(position = position_fill()) +
+  scale_fill_manual(values = c("No Fraude"=COLOR_OK, "Fraude"=COLOR_FRAUD)) +
+  labs(title    = "Método 1 — Cuartiles / Manual",
+       subtitle = "Cortes definidos por boxplot",
+       x = "Rango Monto", y = "Proporción", fill = NULL) +
+  theme(legend.position = "bottom")
+
+# ══════════════════════════════════════════════════════════════
+# MÉTODO 2 — Árbol CART (el más poderoso para fraude)
+# ══════════════════════════════════════════════════════════════
+set.seed(123)
+arbol_monto <- rpart(
+  FLAG_FRAUDE ~ MONTO,
+  data    = disc,
+  method  = "class",
+  control = rpart.control(cp = 0, minbucket = 0)
+)
+
+# Ver el árbol
+rpart.plot(arbol_monto, digits = -1, type = 2, extra = 101,
+           varlen = 3, cex = 0.7, nn = TRUE,
+           main = "Árbol CART — Discretización de MONTO")
+
+# Ver los cortes exactos
+cat("📋 Cortes encontrados por el árbol:\n")
+print(arbol_monto$splits)
+
+# Extraer cortes automáticamente
+cortes_cart <- sort(unique(arbol_monto$splits[, "index"]))
+cat("\nCortes CART:", round(cortes_cart, 2), "\n")
+
+# Crear categorías con esos cortes
+breaks_cart <- c(-Inf, cortes_cart, Inf)
+labels_cart <- paste0(
+  "S/", format(round(c(0, cortes_cart), 0), big.mark=","),
+  " - ",
+  format(round(c(cortes_cart, 999999), 0), big.mark=",")
+)
+
+disc$MONTO_CAT2 <- cut(disc$MONTO,
+                        breaks = breaks_cart,
+                        labels = labels_cart,
+                        right  = FALSE)
+
+table(disc$MONTO_CAT2)
+prop.table(table(disc$MONTO_CAT2, disc$FLAG_FRAUDE), margin = 1)
+
+g2 <- ggplot(disc) + aes(x = MONTO_CAT2, fill = FLAG_FRAUDE) +
+  geom_bar(position = position_fill()) +
+  scale_fill_manual(values = c("No Fraude"=COLOR_OK, "Fraude"=COLOR_FRAUD)) +
+  labs(title    = "Método 2 — Árbol CART ✅ Recomendado",
+       subtitle = "Cortes que maximizan separación fraude vs no fraude",
+       x = "Rango Monto", y = "Proporción", fill = NULL) +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 30, hjust = 1))
+
+# ══════════════════════════════════════════════════════════════
+# MÉTODO 3 — K-means cluster (como tu clase)
+# ══════════════════════════════════════════════════════════════
+set.seed(2022)
+disc$MONTO_CAT3 <- discretize(disc$MONTO,
+                               method = "cluster",
+                               breaks = 4)
+
+table(disc$MONTO_CAT3)
+prop.table(table(disc$MONTO_CAT3, disc$FLAG_FRAUDE), margin = 1)
+
+g3 <- ggplot(disc) + aes(x = MONTO_CAT3, fill = FLAG_FRAUDE) +
+  geom_bar(position = position_fill()) +
+  scale_fill_manual(values = c("No Fraude"=COLOR_OK, "Fraude"=COLOR_FRAUD)) +
+  labs(title    = "Método 3 — K-means Cluster",
+       subtitle = "Cortes por similitud de valores (no usa target)",
+       x = "Rango Monto", y = "Proporción", fill = NULL) +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 30, hjust = 1))
+
+# ══════════════════════════════════════════════════════════════
+# COMPARACIÓN FINAL — Los 3 métodos juntos
+# ══════════════════════════════════════════════════════════════
+plot_grid(g1, g2, g3, nrow = 1,
+          labels = c("Cuartiles","CART","K-means"),
+          label_colour = COLOR_TEXT)
