@@ -1,0 +1,61 @@
+g1
+ggplot(resultado, aes(x = MONTO_CAT2, 
+                       y = TOTAL, 
+                       fill = factor(FRAUDES > 0))) +
+  geom_col(position = position_fill(), alpha = 0.85, color = "white") +
+  geom_text(aes(label = paste0(FRAUD_RATE, "%")),
+            position = position_fill(vjust = 0.5),
+            size = 3.5, color = "white", fontface = "bold") +
+  scale_fill_manual(values = c("FALSE" = COLOR_OK, "TRUE" = COLOR_FRAUD),
+                    labels = c("No Fraude", "Fraude")) +
+  labs(title    = "Proporción de Fraude por Rango de Monto",
+       subtitle = "Cortes definidos por árbol CART",
+       x = "Rango Monto (S/)", y = "Proporción", fill = NULL) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+g2
+ggplot(resultado, aes(x = MONTO_CAT2, group = 1)) +
+  geom_col(aes(y = PCT_FRAUDES_CAPTURADOS),
+           fill = COLOR_FRAUD, alpha = 0.5, color = "white") +
+  geom_line(aes(y = cumsum(PCT_FRAUDES_CAPTURADOS)),
+            color = COLOR_FRAUD, linewidth = 2) +
+  geom_point(aes(y = cumsum(PCT_FRAUDES_CAPTURADOS)),
+             color = COLOR_FRAUD, size = 3) +
+  geom_line(aes(y = PCT_NO_FRAUDE_ALERTADO),
+            color = COLOR_OK, linewidth = 2, linetype = "dashed") +
+  geom_text(aes(y = cumsum(PCT_FRAUDES_CAPTURADOS),
+                label = paste0(round(cumsum(PCT_FRAUDES_CAPTURADOS), 1), "%")),
+            vjust = -0.8, size = 3, color = COLOR_FRAUD) +
+  labs(title    = "Curva de Captura Acumulada de Fraude",
+       subtitle = "Rojo = % fraudes capturados acumulado · Azul punteado = % no fraude alertado",
+       x = "Rango Monto (S/)", y = "%") +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+g3
+ggplot(resultado, aes(x = MONTO_CAT2)) +
+  geom_col(aes(y = TOTAL), fill = COLOR_OK, alpha = 0.5,
+           color = "white") +
+  geom_col(aes(y = FRAUDES * max(resultado$TOTAL) / max(resultado$FRAUDES)),
+           fill = COLOR_FRAUD, alpha = 0.8, color = "white", width = 0.4) +
+  geom_text(aes(y = FRAUDES * max(resultado$TOTAL) / max(resultado$FRAUDES),
+                label = paste0("S/", scales::comma(round(MONTO_FRAUDE, 0)))),
+            vjust = -0.5, size = 2.8, color = COLOR_FRAUD) +
+  scale_y_continuous(
+    name     = "Total transacciones alertadas",
+    sec.axis = sec_axis(
+      ~ . * max(resultado$FRAUDES) / max(resultado$TOTAL),
+      name = "N° Fraudes capturados"
+    )
+  ) +
+  labs(title    = "Volumen Alertado vs Fraudes Capturados por Rango",
+       subtitle = "Verde = total alertas · Rojo = fraudes · Texto = monto fraude capturado",
+       x = "Rango Monto (S/)") +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+
+gf
+plot_grid(g1, g2, g3, 
+          nrow  = 3,
+          labels = c("Proporción", "Captura Acumulada", "Volumen vs Fraude"),
+          label_colour = COLOR_TEXT,
+          label_size   = 9)
