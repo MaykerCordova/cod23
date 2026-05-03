@@ -1,0 +1,45 @@
+# ── Extraer los puntos de corte del árbol ────────────────────────────────────
+cortes <- sort(unique(arbol_monto$splits[, "index"]))
+cat("📋 Cortes encontrados por el árbol:\n")
+print(round(cortes, 2))
+
+# ── Crear rangos con esos cortes ──────────────────────────────────────────────
+# El árbol te dará algo como c(2500, 6800, 12000) — ajusta según salga
+breaks_monto <- c(0, cortes, Inf)
+labels_monto <- paste0(
+  "S/ ", format(round(breaks_monto[-length(breaks_monto)], 0), big.mark=","),
+  " - ",
+  format(round(breaks_monto[-1], 0), big.mark=",")
+)
+labels_monto[length(labels_monto)] <- paste0("S/ ",
+  format(round(tail(cortes,1), 0), big.mark=","), "+")
+
+df_cal[, RANGO_MONTO := cut(MONTO, breaks = breaks_monto,
+                              labels = labels_monto,
+                              include.lowest = TRUE)]
+
+# ── Fraud rate por rango ───────────────────────────────────────────────────────
+fr_rango <- df_cal[, .(
+  TOTAL      = .N,
+  FRAUDES    = sum(FLAG_FRAUDE),
+  MONTO_FRAUDE = sum(MONTO[FLAG_FRAUDE==1], na.rm=TRUE)
+), by = RANGO_MONTO]
+fr_rango[, FRAUD_RATE := round(FRAUDES / TOTAL * 100, 3)]
+fr_rango <- fr_rango[order(RANGO_MONTO)]
+
+print(fr_rango)
+
+# ── Gráfico final ─────────────────────────────────────────────────────────────
+ggplot(fr_rango, aes(x = RANGO_MONTO, y = FRAUD_RATE,
+                      fill = FRAUD_RATE == max(FRAUD_RATE))) +
+  geom_col(alpha = 0.85, color = "white") +
+  geom_text(aes(label = paste0(FRAUDES, " fraudes\n", FRAUD_RATE, "%")),
+            vjust = -0.3, size = 3, color = COLOR_TEXT) +
+  scale_fill_manual(values = c("FALSE"=COLOR_OK, "TRUE"=COLOR_FRAUD),
+                    guide = "none") +
+  scale_y_continuous(labels = scales::percent_format(scale = 1)) +
+  labs(
+    title    = "Fraud Rate por Rango de Monto",
+    subtitle = "Rangos definidos por árbol de decisión — cortes óptimos estadísticos",
+    x = "Rango de Monto (S/)", y = "Fraud Rate (%)"
+  )
