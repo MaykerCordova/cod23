@@ -1,0 +1,28 @@
+# ── Paleta modo CLARO — limpia y profesional ──────────────────
+COLOR_FRAUD  <- "#c0392b"    # rojo oscuro — fraude
+COLOR_OK     <- "#2980b9"    # azul sólido — normal
+COLOR_ACCENT <- "#e67e22"    # naranja — acento
+COLOR_BG     <- "white"      # fondo blanco
+COLOR_PANEL  <- "#f8f9fa"    # panel gris muy claro
+COLOR_GRID   <- "#dee2e6"    # grilla gris suave
+COLOR_TEXT   <- "#212529"    # texto casi negro
+
+tema_fraude <- ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(
+    plot.background  = ggplot2::element_rect(fill = COLOR_BG,    color = NA),
+    panel.background = ggplot2::element_rect(fill = COLOR_PANEL, color = NA),
+    panel.grid.major = ggplot2::element_line(color = COLOR_GRID, linetype = "dashed"),
+    panel.grid.minor = ggplot2::element_blank(),
+    text             = ggplot2::element_text(color = COLOR_TEXT, family = "sans"),
+    axis.text        = ggplot2::element_text(color = "#495057"),
+    axis.title       = ggplot2::element_text(color = COLOR_TEXT, face = "bold"),
+    plot.title       = ggplot2::element_text(color = COLOR_TEXT, face = "bold", size = 13),
+    plot.subtitle    = ggplot2::element_text(color = "#6c757d", size = 10),
+    legend.background= ggplot2::element_rect(fill = "white",     color = NA),
+    legend.text      = ggplot2::element_text(color = COLOR_TEXT),
+    legend.title     = ggplot2::element_text(color = COLOR_TEXT, face = "bold"),
+    strip.background = ggplot2::element_rect(fill = "#e9ecef",   color = NA),
+    strip.text       = ggplot2::element_text(color = COLOR_TEXT, face = "bold"),
+    plot.margin      = ggplot2::margin(10, 10, 10, 10)
+  )
+ggplot2::theme_set(tema_fraude)
