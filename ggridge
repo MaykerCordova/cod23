@@ -1,0 +1,17 @@
+# ✅ Reemplaza p_ridge por esto — sin ggridges
+p_ridge <- ggplot(
+  df_cal[!is.na(MONTO)],
+  aes(x = MONTO, fill = MES_ORIGEN, color = MES_ORIGEN)
+) +
+  geom_density(alpha = 0.45, linewidth = 0.8) +
+  facet_wrap(~MES_ORIGEN, ncol = 1, scales = "free_y") +
+  scale_x_continuous(labels = scales::comma) +
+  scale_fill_manual(values  = c(COLOR_OK, COLOR_ACCENT, COLOR_FRAUD)) +
+  scale_color_manual(values = c(COLOR_OK, COLOR_ACCENT, COLOR_FRAUD)) +
+  labs(
+    title = "Distribución de Montos por Mes",
+    x = "Monto (S/)", y = "Densidad"
+  ) +
+  theme(legend.position = "none")
+
+print(p_density / p_ridge)
