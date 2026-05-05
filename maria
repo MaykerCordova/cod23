@@ -1,0 +1,15 @@
+Var %MoM con Ícono = 
+VAR Variacion = [Var %MoM]
+VAR Flecha = 
+    SWITCH(
+        TRUE(),
+        Variacion > 0, "▲ ",  // Flecha arriba (malo)
+        Variacion < 0, "▼ ",  // Flecha abajo (bueno)
+        "― "                  // Guion (sin cambio)
+    )
+RETURN
+    IF(
+        ISBLANK(Variacion),
+        BLANK(),
+        Flecha & FORMAT(Variacion, "+#,0.0%;-#,0.0%;0.0%")
+    )
