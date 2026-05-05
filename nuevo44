@@ -1,0 +1,121 @@
+# ══════════════════════════════════════════════════════
+# INGESTA Y PROCESAMIENTO — Nueva data Transferencias
+# Monto >= 2000 | Todo texto excepto MONTO y SALDO
+# ══════════════════════════════════════════════════════
+
+import polars as pl
+from pathlib import Path
+
+PARQUET_RAW = r"C:\Users\s4930359\Data_Herramientas\data\Bronze\journal_terceros_consolidado.parquet"
+PARQUET_OUT = r"C:\Users\s4930359\Data_Herramientas\data\Silver\journal_terceros_processed.parquet"
+
+# ── 1. Leer Parquet raw ─────────────────────────────────
+df = pl.read_parquet(PARQUET_RAW)
+print(f"Filas raw: {df.shape[0]:,}  |  Columnas: {df.shape[1]}")
+
+# ── 2. COL_MAP — solo columnas que nos interesan ────────
+COL_MAP = {
+    # Fecha y hora — solo TRX
+    "ACF-FECHA TRX"                        : "FECHA_TRX",
+    "ACF-HORA TRX"                         : "HORA_TRX",
+
+    # Indicador y alertas
+    "ACF-INDICADOR DE FRAUDE"              : "INDICADOR",
+    "GENERO ALERTA"                        : "ALERTA",
+    "ACF-ORIGEN ALERTA"                    : "ORIGEN_ALERTA",
+    "CONDICIONES"                          : "CONDICIONES",
+
+    # Cliente origen
+    "ACF-CUENTA ORIGEN"                    : "CUENTA",
+    "ACF-ID CLIENTE"                       : "ID_CLIENTE",
+
+    # Beneficiario destino
+    "ACF-CUENTA DESTINO"                   : "CUENTA_DESTINO",
+    "ACF-NOMBRE/LOCALIZACION COMERCIO"     : "NOMBRE_BENEFICIARIO",
+
+    # Montos
+    "ACF-MONTO EN MONEDA LOCAL"            : "MONTO",
+    "ACF-SALDO DISPONIBLE EN MONEDA TRX"   : "SALDO_DISPONIBLE_RAW",
+
+    # Canal y producto
+    "ACF-CANAL"                            : "CANAL",
+    "ACF-CODIGO DE SERVICIO"               : "COD_SERV",
+    "ACF-TIPO PROD TC"                     : "TIPO_PROD",
+    "ACF-COD RED COMERCIO"                 : "COD_RED",
+
+    # Historial mes previo
+    "CC : K05_COUNTMP_TAMANO COMERCIO"     : "CNT_MES_PREVIO",
+
+    # Otros útiles
+    "ACF-CODIGO CIO/AGENCIA/OFICINA ORIGEN": "CIO_ORIGEN",
+    "CODIGO DE RECHAZO"                    : "COD_RECHAZO",
+}
+
+# Filtrar solo columnas presentes en el df
+cols_ok  = {k: v for k, v in COL_MAP.items() if k in df.columns}
+cols_err = [k for k in COL_MAP if k not in df.columns]
+
+if cols_err:
+    print(f"\n⚠ Columnas no encontradas ({len(cols_err)}):")
+    for c in cols_err: print(f"  · {c}")
+
+df = df.rename(cols_ok).select(list(cols_ok.values()))
+print(f"\nColumnas seleccionadas: {df.shape[1]}")
+
+# ── 3. Procesar FECHA_TRX ───────────────────────────────
+# Viene como AAAAMMDD pegado → convertir a Date
+df = df.with_columns(
+    pl.col("FECHA_TRX").cast(pl.Utf8).str.zfill(8)
+    .str.to_date(format="%Y%m%d", strict=False)
+    .alias("FECHA_TRX")
+)
+
+# ── 4. Procesar HORA_TRX ────────────────────────────────
+# Viene como HHMMSS → extraer hora como Int32
+df = df.with_columns(
+    pl.col("HORA_TRX").cast(pl.Utf8).str.zfill(6)
+    .str.slice(0, 2).cast(pl.Int32, strict=False)
+    .alias("HORA_TRX")
+)
+
+# ── 5. Montos → Float64 ─────────────────────────────────
+for col in ["MONTO", "SALDO_DISPONIBLE_RAW"]:
+    df = df.with_columns(
+        pl.col(col).cast(pl.Float64, strict=False).alias(col)
+    )
+
+# ── 6. CNT_MES_PREVIO → Float64 ────────────────────────
+df = df.with_columns(
+    pl.col("CNT_MES_PREVIO").cast(pl.Float64, strict=False)
+)
+
+# ── 7. Todo lo demás → Utf8 (texto) ────────────────────
+cols_texto = [
+    "INDICADOR", "ALERTA", "ORIGEN_ALERTA", "CONDICIONES",
+    "CUENTA", "ID_CLIENTE", "CUENTA_DESTINO", "NOMBRE_BENEFICIARIO",
+    "CANAL", "COD_SERV", "TIPO_PROD", "COD_RED",
+    "CIO_ORIGEN", "COD_RECHAZO",
+]
+for col in cols_texto:
+    if col in df.columns:
+        df = df.with_columns(pl.col(col).cast(pl.Utf8))
+
+# ── 8. Validación rápida ────────────────────────────────
+print("\n── Validación ──────────────────────────────")
+print(f"Filas          : {df.shape[0]:,}")
+print(f"Fraudes (F)    : {df.filter(pl.col('INDICADOR') == 'F').shape[0]}")
+print(f"MONTO nulos    : {df['MONTO'].is_null().sum()}")
+print(f"MONTO min      : S/{df['MONTO'].min():,.2f}")
+print(f"MONTO max      : S/{df['MONTO'].max():,.2f}")
+print(f"MONTO promedio : S/{df['MONTO'].mean():,.2f}")
+print(f"\nFecha min : {df['FECHA_TRX'].min()}")
+print(f"Fecha max : {df['FECHA_TRX'].max()}")
+print(f"\nIndicador:")
+print(df.group_by("INDICADOR").agg(pl.len().alias("n")).sort("n", descending=True))
+print(f"\nCanal:")
+print(df.group_by("CANAL").agg(pl.len().alias("n")).sort("n", descending=True))
+
+# ── 9. Guardar Silver ───────────────────────────────────
+Path(PARQUET_OUT).parent.mkdir(parents=True, exist_ok=True)
+df.write_parquet(PARQUET_OUT)
+print(f"\n✅ Silver guardado: {PARQUET_OUT}")
