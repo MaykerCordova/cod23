@@ -1,0 +1,27 @@
+# Franja horaria — ¿discrimina?
+df_hora = df_eval.with_columns(
+    pl.col("HORA_TRX").cast(pl.Utf8).str.zfill(6)
+    .str.slice(0, 2).cast(pl.Int32).alias("hora_int")
+).with_columns(
+    pl.when(pl.col("hora_int") <= 5).then(pl.lit("1_Madrugada(0-5)"))
+    .when(pl.col("hora_int") <= 11).then(pl.lit("2_Mañana(6-11)"))
+    .when(pl.col("hora_int") <= 17).then(pl.lit("3_Tarde(12-17)"))
+    .otherwise(pl.lit("4_Noche(18-23)"))
+    .alias("franja")
+)
+
+franja_f = df_hora.filter(pl.col("es_fraude")).group_by("franja").agg(
+    pl.len().alias("fraudes"),
+    pl.col("MONTO").sum().alias("monto_fraude")
+)
+franja_t = df_hora.group_by("franja").agg(pl.len().alias("total"))
+
+print(
+    franja_f.join(franja_t, on="franja", how="left")
+    .with_columns(
+        (pl.col("fraudes") / pl.col("total") * 100).round(4).alias("fraud_rate_%"),
+        (pl.col("fraudes") / pl.col("total") * 100 /
+         (42 / len(df_hora) * 100)).round(2).alias("lift")
+    )
+    .sort("franja")
+)
