@@ -1,0 +1,100 @@
+# ══════════════════════════════════════════════════════
+# EVALUACIÓN DE REGLAS — Métricas exactas sobre data real
+# ══════════════════════════════════════════════════════
+
+# Preparar df completo con las variables necesarias
+df_eval = df.with_columns([
+    pl.col("SALDO_DISPONIBLE_RAW").cast(pl.Float64, strict=False).alias("SALDO_NUM"),
+    pl.col("CNT_MES_PREVIO").cast(pl.Float64, strict=False),
+]).with_columns([
+    (pl.col("MONTO") / (
+        pl.col("MONTO") + pl.col("SALDO_NUM").clip(lower_bound=0))
+    ).alias("ratio_vaciado"),
+    (pl.col("INDICADOR") == "F").alias("es_fraude"),
+])
+
+# Frecuencia cuenta destino
+freq_dest = df.group_by("CUENTA_DESTINO").agg(pl.len().alias("freq_destino"))
+df_eval = df_eval.join(freq_dest, on="CUENTA_DESTINO", how="left")
+
+total_trx    = len(df_eval)
+total_fraude = df_eval.filter(pl.col("es_fraude")).height
+monto_total_fraude = df_eval.filter(pl.col("es_fraude"))["MONTO"].sum()
+
+print(f"Total trx    : {total_trx:,}")
+print(f"Total fraudes: {total_fraude}")
+print(f"Monto total  : S/{monto_total_fraude:,.2f}")
+print("=" * 60)
+
+def evaluar_regla(nombre, mascara_regla):
+    activadas       = df_eval.filter(mascara_regla)
+    fraudes_cap     = activadas.filter(pl.col("es_fraude"))
+    falsos_pos      = activadas.filter(~pl.col("es_fraude"))
+
+    n_activadas     = activadas.height
+    n_fraudes_cap   = fraudes_cap.height
+    n_fp            = falsos_pos.height
+    monto_cap       = fraudes_cap["MONTO"].sum() if n_fraudes_cap > 0 else 0
+
+    precision       = n_fraudes_cap / n_activadas * 100 if n_activadas > 0 else 0
+    recall          = n_fraudes_cap / total_fraude * 100
+    pct_trx         = n_activadas / total_trx * 100
+    pct_monto_cap   = monto_cap / monto_total_fraude * 100
+
+    print(f"\n{'─'*60}")
+    print(f"  {nombre}")
+    print(f"{'─'*60}")
+    print(f"  Trx activadas        : {n_activadas:,}  ({pct_trx:.3f}% del total)")
+    print(f"  Fraudes capturados   : {n_fraudes_cap}  ({recall:.1f}% recall)")
+    print(f"  Falsos positivos     : {n_fp:,}")
+    print(f"  Precisión            : {precision:.1f}%")
+    print(f"  Monto protegido      : S/{monto_cap:,.2f}  ({pct_monto_cap:.1f}% del total fraude)")
+
+# ── REGLA 1 ────────────────────────────────────────────
+evaluar_regla(
+    "R1 — Cuenta sin historial + vaciado alto",
+    (pl.col("CNT_MES_PREVIO") == 0) &
+    (pl.col("ratio_vaciado") >= 0.90) &
+    (pl.col("MONTO") >= 1200)
+)
+
+# ── REGLA 2 ────────────────────────────────────────────
+evaluar_regla(
+    "R2 — Destino nuevo + monto alto + sin historial",
+    (pl.col("freq_destino") == 1) &
+    (pl.col("MONTO") >= 1500) &
+    (pl.col("CNT_MES_PREVIO") <= 1)
+)
+
+# ── REGLA 3 ────────────────────────────────────────────
+evaluar_regla(
+    "R3 — Vaciado extremo",
+    (pl.col("ratio_vaciado") >= 0.95) &
+    (pl.col("MONTO") >= 1200)
+)
+
+# ── REGLA 4 ────────────────────────────────────────────
+evaluar_regla(
+    "R4 — Señales múltiples combinadas",
+    (pl.col("CNT_MES_PREVIO") <= 3) &
+    (pl.col("freq_destino") <= 2) &
+    (pl.col("MONTO") >= 1400) &
+    (pl.col("MONTO") <= 2000)
+)
+
+# ── R1 + R2 COMBINADAS (union) ─────────────────────────
+evaluar_regla(
+    "R1 + R2 combinadas (OR)",
+    (
+        (pl.col("CNT_MES_PREVIO") == 0) &
+        (pl.col("ratio_vaciado") >= 0.90) &
+        (pl.col("MONTO") >= 1200)
+    ) | (
+        (pl.col("freq_destino") == 1) &
+        (pl.col("MONTO") >= 1500) &
+        (pl.col("CNT_MES_PREVIO") <= 1)
+    )
+)
+
+print("\n" + "=" * 60)
+print("✅ Evaluación completada")
