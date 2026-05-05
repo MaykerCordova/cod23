@@ -1,0 +1,67 @@
+# ══════════════════════════════════════════════════════
+# REFINAMIENTO DE REGLAS — Umbrales más estrictos
+# ══════════════════════════════════════════════════════
+
+print("Buscando el umbral óptimo de ratio_vaciado para R1...\n")
+for rv in [0.90, 0.92, 0.95, 0.97, 0.99]:
+    mascara = (
+        (pl.col("CNT_MES_PREVIO") == 0) &
+        (pl.col("ratio_vaciado") >= rv) &
+        (pl.col("MONTO") >= 1200)
+    )
+    act = df_eval.filter(mascara)
+    f   = act.filter(pl.col("es_fraude")).height
+    tot = act.height
+    prec = f/tot*100 if tot > 0 else 0
+    print(f"  ratio_vaciado >= {rv:.2f}  →  {tot:,} trx  |  {f} fraudes  |  precisión {prec:.2f}%")
+
+print("\n\nBuscando umbral óptimo de freq_destino para R2...\n")
+for fd in [1, 2, 3]:
+    for rv in [0.80, 0.90, 0.95]:
+        mascara = (
+            (pl.col("freq_destino") <= fd) &
+            (pl.col("ratio_vaciado") >= rv) &
+            (pl.col("MONTO") >= 1500)
+        )
+        act = df_eval.filter(mascara)
+        f   = act.filter(pl.col("es_fraude")).height
+        tot = act.height
+        prec = f/tot*100 if tot > 0 else 0
+        print(f"  freq<={fd} + vaciado>={rv:.2f}  →  {tot:,} trx  |  {f} fraudes  |  precisión {prec:.2f}%")
+
+print("\n\nRegla ultra-estricta — las 3 señales fuertes combinadas...\n")
+mascara_ultra = (
+    (pl.col("CNT_MES_PREVIO") == 0) &
+    (pl.col("ratio_vaciado") >= 0.95) &
+    (pl.col("freq_destino") == 1) &
+    (pl.col("MONTO") >= 1200)
+)
+act = df_eval.filter(mascara_ultra)
+f   = act.filter(pl.col("es_fraude")).height
+tot = act.height
+fp  = tot - f
+monto = act.filter(pl.col("es_fraude"))["MONTO"].sum() if f > 0 else 0
+prec  = f/tot*100 if tot > 0 else 0
+rec   = f/total_fraude*100
+print(f"  CNT_MES_PREVIO=0 + ratio>=0.95 + freq_destino=1 + MONTO>=1200")
+print(f"  Trx activadas   : {tot:,}  ({tot/total_trx*100:.3f}% del total)")
+print(f"  Fraudes cap.    : {f}  ({rec:.1f}% recall)")
+print(f"  Falsos positivos: {fp:,}")
+print(f"  Precisión       : {prec:.2f}%")
+print(f"  Monto protegido : S/{monto:,.2f}  ({monto/monto_total_fraude*100:.1f}% del total)")
+
+# Variantes del umbral de monto
+print("\n\nImpacto del umbral de monto en regla ultra-estricta...\n")
+for m in [1200, 1400, 1500, 1600, 1800]:
+    mascara = (
+        (pl.col("CNT_MES_PREVIO") == 0) &
+        (pl.col("ratio_vaciado") >= 0.95) &
+        (pl.col("freq_destino") == 1) &
+        (pl.col("MONTO") >= m)
+    )
+    act = df_eval.filter(mascara)
+    f   = act.filter(pl.col("es_fraude")).height
+    tot = act.height
+    prec = f/tot*100 if tot > 0 else 0
+    monto = act.filter(pl.col("es_fraude"))["MONTO"].sum() if f > 0 else 0
+    print(f"  MONTO>={m}  →  {tot:,} trx  |  {f} fraudes  |  precisión {prec:.2f}%  |  S/{monto:,.0f}")
