@@ -1,0 +1,125 @@
+# ══════════════════════════════════════════════════════
+# EDA — 42 FRAUDES · Transferencias a Terceros
+# ══════════════════════════════════════════════════════
+
+import pandas as pd
+import numpy as np
+
+fraudes = df[df["INDICADOR"] == "F"].copy()
+data_total = len(df)
+
+print("=" * 55)
+print(f"  TOTAL TRANSACCIONES : {data_total:,}")
+print(f"  FRAUDES             : {len(fraudes)}")
+print(f"  TASA DE FRAUDE      : {len(fraudes)/data_total*100:.4f}%")
+print("=" * 55)
+
+# ── 1. MONTO ───────────────────────────────────────────
+print("\n📊 MONTO DE FRAUDES (S/)")
+print(fraudes["MONTO"].describe().apply(lambda x: f"S/ {x:,.2f}"))
+print(f"  Monto TOTAL fraude  : S/ {fraudes['MONTO'].sum():,.2f}")
+
+# Deciles de monto en fraudes
+fraudes["decil_monto"] = pd.qcut(fraudes["MONTO"], q=10,
+                                  labels=[f"D{i}" for i in range(1,11)],
+                                  duplicates="drop")
+print("\n  Fraudes por decil de monto:")
+print(fraudes.groupby("decil_monto")["MONTO"].agg(["count","sum","min","max"])
+      .rename(columns={"count":"n","sum":"monto_total","min":"min_monto","max":"max_monto"}))
+
+# ── 2. ALERTA DEL MOTOR ACTUAL ─────────────────────────
+print("\n\n🚨 ¿FUE ALERTADO POR EL MOTOR ACTUAL?")
+fraudes["fue_alertada"] = fraudes["ALERTA"].notna() & (fraudes["ALERTA"] != "")
+resumen_alerta = fraudes["fue_alertada"].value_counts()
+print(f"  Sí alertado : {resumen_alerta.get(True, 0)}")
+print(f"  No alertado : {resumen_alerta.get(False, 0)}")
+print(f"  → El motor actual NO captura el "
+      f"{resumen_alerta.get(False,0)/len(fraudes)*100:.1f}% de los fraudes")
+
+# ── 3. CANAL ───────────────────────────────────────────
+print("\n\n📱 DISTRIBUCIÓN POR CANAL")
+canal_fraude = fraudes["CANAL"].value_counts()
+canal_total  = df["CANAL"].value_counts()
+canal_df = pd.DataFrame({
+    "fraudes"    : canal_fraude,
+    "total_trx"  : canal_total,
+}).fillna(0).astype(int)
+canal_df["fraud_rate_%"] = (canal_df["fraudes"] / canal_df["total_trx"] * 100).round(4)
+print(canal_df)
+
+# ── 4. FRANJA HORARIA ──────────────────────────────────
+print("\n\n🕐 DISTRIBUCIÓN POR FRANJA HORARIA")
+
+def parse_hora(h):
+    try:
+        s = str(int(h)).zfill(6)
+        return int(s[:2])
+    except:
+        return np.nan
+
+fraudes["hora_int"] = fraudes["HORA_TRX"].apply(parse_hora)
+df["hora_int"]      = df["HORA_TRX"].apply(parse_hora)
+
+def franja(h):
+    if pd.isna(h):   return "desconocida"
+    if h <= 5:       return "Madrugada (0-5h)"
+    elif h <= 11:    return "Mañana (6-11h)"
+    elif h <= 17:    return "Tarde (12-17h)"
+    else:            return "Noche (18-23h)"
+
+fraudes["franja"] = fraudes["hora_int"].apply(franja)
+df["franja"]      = df["hora_int"].apply(franja)
+
+franja_fraude = fraudes["franja"].value_counts()
+franja_total  = df["franja"].value_counts()
+franja_df = pd.DataFrame({
+    "fraudes"   : franja_fraude,
+    "total_trx" : franja_total,
+}).fillna(0).astype(int)
+franja_df["fraud_rate_%"] = (franja_df["fraudes"] / franja_df["total_trx"] * 100).round(4)
+print(franja_df)
+
+# ── 5. RATIO DE VACIADO ────────────────────────────────
+print("\n\n💸 RATIO DE VACIADO DE CUENTA (monto / monto + saldo_post)")
+fraudes["SALDO_NUM"] = pd.to_numeric(fraudes["SALDO_DISPONIBLE_RAW"], errors="coerce")
+fraudes["ratio_vaciado"] = fraudes["MONTO"] / (
+    fraudes["MONTO"] + fraudes["SALDO_NUM"].clip(lower=0)
+)
+print(fraudes["ratio_vaciado"].describe().apply(lambda x: f"{x:.4f}"))
+
+umbrales = [0.5, 0.7, 0.8, 0.9, 0.95]
+print("\n  Fraudes por umbral de vaciado:")
+for u in umbrales:
+    n = (fraudes["ratio_vaciado"] >= u).sum()
+    print(f"  ratio >= {u:.2f}  →  {n:2d} fraudes  ({n/len(fraudes)*100:.1f}%)")
+
+# ── 6. BENEFICIARIO NUEVO ──────────────────────────────
+print("\n\n🏦 FRECUENCIA DE CUENTA DESTINO EN TODA LA DATA")
+freq_destino = df["CUENTA_DESTINO"].value_counts()
+fraudes["freq_destino"] = fraudes["CUENTA_DESTINO"].map(freq_destino)
+
+print(fraudes["freq_destino"].describe().apply(lambda x: f"{x:.2f}"))
+
+print("\n  Fraudes por frecuencia de cuenta destino:")
+for umbral in [1, 2, 3, 5]:
+    n = (fraudes["freq_destino"] <= umbral).sum()
+    print(f"  dest aparece <= {umbral} vez(es) en data  →  {n:2d} fraudes ({n/len(fraudes)*100:.1f}%)")
+
+# ── 7. CNT_MES_PREVIO (comportamiento histórico) ───────
+print("\n\n📅 CNT_MES_PREVIO (transacciones del cliente el mes anterior)")
+fraudes["CNT_MES_PREVIO"] = pd.to_numeric(fraudes["CNT_MES_PREVIO"], errors="coerce")
+print(fraudes["CNT_MES_PREVIO"].describe().apply(lambda x: f"{x:.2f}"))
+
+n_cero = (fraudes["CNT_MES_PREVIO"] == 0).sum()
+print(f"\n  Fraudes con CNT_MES_PREVIO = 0 : {n_cero} ({n_cero/len(fraudes)*100:.1f}%)")
+print("  → Cliente sin historial previo el mes anterior")
+
+# ── 8. TIPO_PROD ───────────────────────────────────────
+print("\n\n🏷️  DISTRIBUCIÓN POR TIPO_PROD")
+tp_fraude = fraudes["TIPO_PROD"].value_counts()
+tp_total  = df["TIPO_PROD"].value_counts()
+tp_df = pd.DataFrame({"fraudes": tp_fraude, "total_trx": tp_total}).fillna(0).astype(int)
+tp_df["fraud_rate_%"] = (tp_df["fraudes"] / tp_df["total_trx"] * 100).round(4)
+print(tp_df)
+
+print("\n✅ EDA completado — pega los outputs aquí para diseñar las reglas")
