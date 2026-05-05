@@ -1,0 +1,106 @@
+# ══════════════════════════════════════════════════════
+# EDA MONTO — Nueva data Transferencias >= S/2,000
+# ══════════════════════════════════════════════════════
+
+df = pl.read_parquet(r"C:\Users\s4930359\Data_Herramientas\data\Silver\journal_terceros_processed.parquet")
+
+fraudes = df.filter(pl.col("INDICADOR") == "F")
+total_trx = len(df)
+total_fraude = len(fraudes)
+monto_total  = fraudes["MONTO"].sum()
+
+print("=" * 55)
+print(f"  TOTAL TRX    : {total_trx:,}")
+print(f"  FRAUDES      : {total_fraude}")
+print(f"  TASA FRAUDE  : {total_fraude/total_trx*100:.4f}%")
+print(f"  MONTO TOTAL  : S/{monto_total:,.2f}")
+print("=" * 55)
+
+# ── Estadísticos de monto ───────────────────────────────
+print("\n📊 MONTO EN FRAUDES:")
+print(fraudes.select("MONTO").describe())
+
+# ── Distribución por rangos ─────────────────────────────
+print("\nFraudes por rango de monto:")
+rangos = [
+    (2000,   3000),
+    (3000,   5000),
+    (5000,  10000),
+    (10000, 20000),
+    (20000, 50000),
+    (50000, 999999),
+]
+for lo, hi in rangos:
+    sub = fraudes.filter(
+        (pl.col("MONTO") >= lo) & (pl.col("MONTO") < hi)
+    )
+    n     = sub.height
+    monto = sub["MONTO"].sum() if n > 0 else 0
+    pct_n = n / total_fraude * 100
+    pct_m = monto / monto_total * 100
+    print(f"  S/{lo:>6,} – S/{hi:>7,}  →  {n:2d} fraudes ({pct_n:.1f}%)  |  S/{monto:>10,.0f} ({pct_m:.1f}% del monto)")
+
+# ── Ratio vaciado ───────────────────────────────────────
+print("\n\n💸 RATIO DE VACIADO:")
+fraudes = fraudes.with_columns(
+    pl.col("SALDO_DISPONIBLE_RAW").cast(pl.Float64, strict=False).alias("SALDO_NUM")
+).with_columns(
+    (pl.col("MONTO") / (
+        pl.col("MONTO") + pl.col("SALDO_NUM").clip(lower_bound=0))
+    ).alias("ratio_vaciado")
+)
+print(fraudes.select("ratio_vaciado").describe())
+
+for u in [0.5, 0.7, 0.8, 0.9, 0.95]:
+    n     = fraudes.filter(pl.col("ratio_vaciado") >= u).height
+    monto = fraudes.filter(pl.col("ratio_vaciado") >= u)["MONTO"].sum() if n > 0 else 0
+    print(f"  >= {u:.2f}  →  {n:2d} fraudes  |  S/{monto:,.0f}")
+
+# ── Frecuencia cuenta destino ───────────────────────────
+print("\n\n🏦 FRECUENCIA CUENTA DESTINO:")
+freq_dest = df.group_by("CUENTA_DESTINO").agg(pl.len().alias("freq_destino"))
+fraudes = fraudes.join(freq_dest, on="CUENTA_DESTINO", how="left")
+print(fraudes.select("freq_destino").describe())
+
+for u in [1, 2, 3, 5]:
+    n     = fraudes.filter(pl.col("freq_destino") <= u).height
+    monto = fraudes.filter(pl.col("freq_destino") <= u)["MONTO"].sum() if n > 0 else 0
+    print(f"  freq <= {u}  →  {n:2d} fraudes  |  S/{monto:,.0f}")
+
+# ── CNT_MES_PREVIO ──────────────────────────────────────
+print("\n\n📅 CNT_MES_PREVIO:")
+print(fraudes.select("CNT_MES_PREVIO").describe())
+
+for u in [0, 1, 3, 5]:
+    n     = fraudes.filter(pl.col("CNT_MES_PREVIO") <= u).height
+    monto = fraudes.filter(pl.col("CNT_MES_PREVIO") <= u)["MONTO"].sum() if n > 0 else 0
+    print(f"  CNT_MES_PREVIO <= {u}  →  {n:2d} fraudes  |  S/{monto:,.0f}")
+
+# ── Franja horaria ──────────────────────────────────────
+print("\n\n🕐 FRANJA HORARIA:")
+fraudes_h = fraudes.with_columns(
+    pl.when(pl.col("HORA_TRX") <= 5).then(pl.lit("Madrugada(0-5)"))
+    .when(pl.col("HORA_TRX") <= 11).then(pl.lit("Mañana(6-11)"))
+    .when(pl.col("HORA_TRX") <= 17).then(pl.lit("Tarde(12-17)"))
+    .otherwise(pl.lit("Noche(18-23)")).alias("franja")
+)
+df_h = df.with_columns(
+    pl.when(pl.col("HORA_TRX") <= 5).then(pl.lit("Madrugada(0-5)"))
+    .when(pl.col("HORA_TRX") <= 11).then(pl.lit("Mañana(6-11)"))
+    .when(pl.col("HORA_TRX") <= 17).then(pl.lit("Tarde(12-17)"))
+    .otherwise(pl.lit("Noche(18-23)")).alias("franja")
+)
+franja_f = fraudes_h.group_by("franja").agg(
+    pl.len().alias("fraudes"),
+    pl.col("MONTO").sum().alias("monto_expuesto")
+)
+franja_t = df_h.group_by("franja").agg(pl.len().alias("total"))
+print(
+    franja_f.join(franja_t, on="franja", how="left")
+    .with_columns(
+        (pl.col("fraudes") / pl.col("total") * 100).round(4).alias("fraud_rate_%")
+    )
+    .sort("fraudes", descending=True)
+)
+
+print("\n✅ EDA completado")
