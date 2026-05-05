@@ -1,0 +1,89 @@
+# ══════════════════════════════════════════════════════
+# ANÁLISIS DE HASH POR CLIENTE — Fraudes vs Legítimos
+# ══════════════════════════════════════════════════════
+
+# Hashes distintos por cuenta en toda la data
+hash_por_cuenta = (
+    df.group_by("CUENTA")
+    .agg(pl.col("HASH_DISPOSITIVO").n_unique().alias("n_hashes_cuenta"))
+)
+
+# Unir al df_eval
+df_score = df_score.join(hash_por_cuenta, on="CUENTA", how="left")
+
+# ── Distribución en FRAUDES ─────────────────────────────
+print("n_hashes por cuenta en FRAUDES:")
+print(
+    df_score.filter(pl.col("es_fraude"))
+    .select("n_hashes_cuenta")
+    .describe()
+)
+
+print("\nFraudes por n_hashes:")
+for h in [1, 2, 3, 4, 5]:
+    n = df_score.filter(
+        pl.col("es_fraude") & (pl.col("n_hashes_cuenta") == h)
+    ).height
+    monto = df_score.filter(
+        pl.col("es_fraude") & (pl.col("n_hashes_cuenta") == h)
+    )["MONTO"].sum() if n > 0 else 0
+    print(f"  n_hashes = {h}  →  {n} fraudes  |  S/{monto:,.0f}")
+
+# ── Distribución en NO FRAUDES ──────────────────────────
+print("\nn_hashes por cuenta en NO FRAUDES:")
+print(
+    df_score.filter(~pl.col("es_fraude"))
+    .select("n_hashes_cuenta")
+    .describe()
+)
+
+# ── Score mejorado con hash + franja ───────────────────
+print("\n\nScore mejorado — agregando hash y franja horaria\n")
+
+df_score2 = df_score.with_columns([
+    # Hash: cuenta con 1 solo dispositivo → puede ser víctima (no ayuda)
+    # Hash: cuenta con MUCHOS dispositivos → señal de fraude organizado
+    pl.when(pl.col("n_hashes_cuenta") >= 4).then(30)
+    .when(pl.col("n_hashes_cuenta") >= 3).then(15)
+    .otherwise(0)
+    .alias("pts_hash"),
+
+    # Franja horaria
+    pl.when(pl.col("hora_int") <= 5).then(25)
+    .when(pl.col("hora_int") >= 20).then(10)
+    .otherwise(0)
+    .alias("pts_franja"),
+
+]).with_columns(
+    (pl.col("pts_historial") +
+     pl.col("pts_vaciado") +
+     pl.col("pts_destino") +
+     pl.col("pts_hash") +
+     pl.col("pts_franja"))
+    .alias("score_v2")
+)
+
+print(f"{'Umbral':>8} | {'Trx act':>8} | {'% total':>7} | "
+      f"{'Fraudes':>7} | {'Recall':>7} | {'Precisión':>10} | {'Monto prot.':>12}")
+print("─" * 72)
+
+for umbral in [60, 70, 80, 90, 100, 110, 120]:
+    mask = pl.col("score_v2") >= umbral
+    act  = df_score2.filter(mask)
+    f    = act.filter(pl.col("es_fraude")).height
+    tot  = act.height
+    if tot == 0:
+        continue
+    prec  = f / tot * 100
+    rec   = f / total_fraude * 100
+    pct   = tot / total_trx * 100
+    monto = act.filter(pl.col("es_fraude"))["MONTO"].sum() if f > 0 else 0
+    print(f"  >= {umbral:3d}  | {tot:>8,} | {pct:>6.3f}% | "
+          f"{f:>7} | {rec:>6.1f}% | {prec:>9.2f}% | S/{monto:>10,.0f}")
+
+# Distribución score_v2 en fraudes vs no fraudes
+print("\nScore v2 en FRAUDES:")
+print(df_score2.filter(pl.col("es_fraude")).select("score_v2").describe())
+
+print("\nScore v2 en NO FRAUDES:")
+print(df_score2.filter(~pl.col("es_fraude")).select("score_v2").describe())
