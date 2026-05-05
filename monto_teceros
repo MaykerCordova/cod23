@@ -1,0 +1,20 @@
+# ── Monto completo ──────────────────────────────────────
+print(fraudes.select("MONTO").describe())
+
+# Distribución de montos — ver si se concentran cerca del umbral
+rangos = [
+    (1000, 1200),
+    (1200, 1500),
+    (1500, 2000),
+    (2000, 3000),
+    (3000, 99999),
+]
+print("\nFraudes por rango de monto:")
+for lo, hi in rangos:
+    n = fraudes.filter(
+        (pl.col("MONTO") >= lo) & (pl.col("MONTO") < hi)
+    ).height
+    monto = fraudes.filter(
+        (pl.col("MONTO") >= lo) & (pl.col("MONTO") < hi)
+    )["MONTO"].sum()
+    print(f"  S/{lo:,} – S/{hi:,}  →  {n} fraudes  |  S/{monto:,.0f} expuesto")
