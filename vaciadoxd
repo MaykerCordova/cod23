@@ -1,0 +1,82 @@
+# ── Canal + Franja + Vaciado + Destino (todo junto) ────
+# CANAL
+canal_f = fraudes.group_by("CANAL").agg(pl.len().alias("fraudes"))
+canal_t = df.group_by("CANAL").agg(pl.len().alias("total"))
+print("=== CANAL ===")
+print(
+    canal_f.join(canal_t, on="CANAL", how="left")
+    .with_columns(
+        (pl.col("fraudes") / pl.col("total") * 100).round(4).alias("fraud_rate_%"),
+        (pl.col("fraudes") * 1441).alias("monto_estimado")  # aprox por promedio
+    )
+    .sort("fraudes", descending=True)
+)
+
+# FRANJA HORARIA
+print("\n=== FRANJA HORARIA ===")
+fraudes_h = fraudes.with_columns(
+    pl.col("HORA_TRX").cast(pl.Utf8).str.zfill(6)
+    .str.slice(0, 2).cast(pl.Int32).alias("hora_int")
+).with_columns(
+    pl.when(pl.col("hora_int") <= 5).then(pl.lit("Madrugada(0-5)"))
+    .when(pl.col("hora_int") <= 11).then(pl.lit("Mañana(6-11)"))
+    .when(pl.col("hora_int") <= 17).then(pl.lit("Tarde(12-17)"))
+    .otherwise(pl.lit("Noche(18-23)")).alias("franja")
+)
+df_h = df.with_columns(
+    pl.col("HORA_TRX").cast(pl.Utf8).str.zfill(6)
+    .str.slice(0, 2).cast(pl.Int32).alias("hora_int")
+).with_columns(
+    pl.when(pl.col("hora_int") <= 5).then(pl.lit("Madrugada(0-5)"))
+    .when(pl.col("hora_int") <= 11).then(pl.lit("Mañana(6-11)"))
+    .when(pl.col("hora_int") <= 17).then(pl.lit("Tarde(12-17)"))
+    .otherwise(pl.lit("Noche(18-23)")).alias("franja")
+)
+franja_f = fraudes_h.group_by("franja").agg(
+    pl.len().alias("fraudes"),
+    pl.col("MONTO").sum().alias("monto_expuesto")
+)
+franja_t = df_h.group_by("franja").agg(pl.len().alias("total"))
+print(
+    franja_f.join(franja_t, on="franja", how="left")
+    .with_columns(
+        (pl.col("fraudes") / pl.col("total") * 100).round(4).alias("fraud_rate_%")
+    )
+    .sort("fraudes", descending=True)
+)
+
+# RATIO VACIADO
+print("\n=== RATIO VACIADO ===")
+fraudes_v = fraudes.with_columns(
+    pl.col("SALDO_DISPONIBLE_RAW").cast(pl.Float64, strict=False).alias("SALDO_NUM")
+).with_columns(
+    (pl.col("MONTO") / (
+        pl.col("MONTO") + pl.col("SALDO_NUM").clip(lower_bound=0))
+    ).alias("ratio_vaciado")
+)
+print(fraudes_v.select("ratio_vaciado").describe())
+for u in [0.5, 0.7, 0.8, 0.9, 0.95]:
+    n = fraudes_v.filter(pl.col("ratio_vaciado") >= u).height
+    monto = fraudes_v.filter(pl.col("ratio_vaciado") >= u)["MONTO"].sum()
+    print(f"  >= {u:.2f}  →  {n:2d} fraudes  |  S/{monto:,.0f} expuesto")
+
+# FRECUENCIA CUENTA DESTINO
+print("\n=== FRECUENCIA CUENTA DESTINO ===")
+freq_dest = df.group_by("CUENTA_DESTINO").agg(pl.len().alias("freq_destino"))
+fraudes_d = fraudes.join(freq_dest, on="CUENTA_DESTINO", how="left")
+print(fraudes_d.select("freq_destino").describe())
+for u in [1, 2, 3, 5]:
+    n = fraudes_d.filter(pl.col("freq_destino") <= u).height
+    monto = fraudes_d.filter(pl.col("freq_destino") <= u)["MONTO"].sum()
+    print(f"  freq <= {u}  →  {n:2d} fraudes  |  S/{monto:,.0f} expuesto")
+
+# CNT_MES_PREVIO
+print("\n=== CNT_MES_PREVIO ===")
+fraudes_c = fraudes.with_columns(
+    pl.col("CNT_MES_PREVIO").cast(pl.Float64, strict=False)
+)
+print(fraudes_c.select("CNT_MES_PREVIO").describe())
+for u in [0, 1, 3, 5]:
+    n = fraudes_c.filter(pl.col("CNT_MES_PREVIO") <= u).height
+    monto = fraudes_c.filter(pl.col("CNT_MES_PREVIO") <= u)["MONTO"].sum()
+    print(f"  CNT_MES_PREVIO <= {u}  →  {n:2d} fraudes  |  S/{monto:,.0f} expuesto")
