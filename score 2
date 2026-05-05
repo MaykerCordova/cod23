@@ -1,0 +1,93 @@
+# ══════════════════════════════════════════════════════
+# SCORE V2 — Reconstrucción completa desde df_eval
+# ══════════════════════════════════════════════════════
+
+# Paso 1: hora_int desde el nombre real de la columna
+df_score2 = df_eval.with_columns(
+    pl.col("HORA_TRX").cast(pl.Utf8).str.zfill(6)
+    .str.slice(0, 2).cast(pl.Int32).alias("hora_int")
+)
+
+# Paso 2: hashes distintos por cuenta
+hash_por_cuenta = (
+    df.group_by("CUENTA")
+    .agg(pl.col("HASH_DISPOSITIVO").n_unique().alias("n_hashes_cuenta"))
+)
+df_score2 = df_score2.join(hash_por_cuenta, on="CUENTA", how="left")
+
+# Paso 3: construir todos los puntos
+df_score2 = df_score2.with_columns([
+
+    # Historial mes anterior
+    pl.when(pl.col("CNT_MES_PREVIO") == 0).then(40)
+    .when(pl.col("CNT_MES_PREVIO") <= 2).then(20)
+    .otherwise(0)
+    .alias("pts_historial"),
+
+    # Vaciado de cuenta
+    pl.when(pl.col("ratio_vaciado") >= 0.95).then(35)
+    .when(pl.col("ratio_vaciado") >= 0.80).then(20)
+    .when(pl.col("ratio_vaciado") >= 0.50).then(10)
+    .otherwise(0)
+    .alias("pts_vaciado"),
+
+    # Frecuencia cuenta destino
+    pl.when(pl.col("freq_destino") == 1).then(25)
+    .when(pl.col("freq_destino") <= 3).then(10)
+    .otherwise(0)
+    .alias("pts_destino"),
+
+    # Hash: muchos dispositivos distintos = sospechoso
+    pl.when(pl.col("n_hashes_cuenta") >= 4).then(30)
+    .when(pl.col("n_hashes_cuenta") >= 3).then(15)
+    .otherwise(0)
+    .alias("pts_hash"),
+
+    # Franja horaria
+    pl.when(pl.col("hora_int") <= 5).then(25)
+    .when(pl.col("hora_int") >= 20).then(10)
+    .otherwise(0)
+    .alias("pts_franja"),
+
+]).with_columns(
+    (pl.col("pts_historial") +
+     pl.col("pts_vaciado") +
+     pl.col("pts_destino") +
+     pl.col("pts_hash") +
+     pl.col("pts_franja"))
+    .alias("score_v2")
+)
+
+# Paso 4: evaluar por umbral
+print(f"{'Umbral':>8} | {'Trx act':>8} | {'% total':>7} | "
+      f"{'Fraudes':>7} | {'Recall':>7} | {'Precisión':>10} | {'Monto prot.':>12}")
+print("─" * 75)
+
+for umbral in [50, 60, 70, 80, 90, 100, 110, 120]:
+    act  = df_score2.filter(pl.col("score_v2") >= umbral)
+    f    = act.filter(pl.col("es_fraude")).height
+    tot  = act.height
+    if tot == 0:
+        continue
+    prec  = f / tot * 100
+    rec   = f / total_fraude * 100
+    pct   = tot / total_trx * 100
+    monto = act.filter(pl.col("es_fraude"))["MONTO"].sum() if f > 0 else 0
+    print(f"  >= {umbral:3d}  | {tot:>8,} | {pct:>6.3f}% | "
+          f"{f:>7} | {rec:>6.1f}% | {prec:>9.2f}% | S/{monto:>10,.0f}")
+
+# Paso 5: distribución del score
+print("\nScore v2 en FRAUDES:")
+print(df_score2.filter(pl.col("es_fraude")).select("score_v2").describe())
+
+print("\nScore v2 en NO FRAUDES:")
+print(df_score2.filter(~pl.col("es_fraude")).select("score_v2").describe())
+
+# Paso 6: distribución de n_hashes en fraudes
+print("\nn_hashes en FRAUDES:")
+print(
+    df_score2.filter(pl.col("es_fraude"))
+    .group_by("n_hashes_cuenta")
+    .agg(pl.len().alias("n"), pl.col("MONTO").sum().alias("monto"))
+    .sort("n_hashes_cuenta")
+)
