@@ -3,7 +3,7 @@ from pathlib import Path
 from datetime import datetime
 import hashlib
 import sqlite3
-# mejora mike
+#mejora mike 2
 # =======================
 # CONFIGURACIÓN DE RUTAS
 # =======================
@@ -14,7 +14,6 @@ SILVER_PATH = BASE_PATH / 'Silver'
 GOLD_PATH = BASE_PATH / 'Gold'
 METADATA_PATH = BASE_PATH / 'Metadata'
 
-# Crear carpetas si no existen
 for path in [BRONZE_PATH, SILVER_PATH, GOLD_PATH, METADATA_PATH]:
     path.mkdir(parents=True, exist_ok=True)
 
@@ -44,9 +43,6 @@ def inicializar_metadata_db():
 # FUNCIÓN: CALCULAR HASH DE ARCHIVO
 # =======================
 def calcular_hash_archivo(filepath: Path) -> str:
-    """
-    Genera hash SHA-256 del contenido del archivo para detectar cambios.
-    """
     sha256 = hashlib.sha256()
     with open(filepath, 'rb') as f:
         for chunk in iter(lambda: f.read(4096), b''):
@@ -57,9 +53,6 @@ def calcular_hash_archivo(filepath: Path) -> str:
 # FUNCIÓN: OBTENER ARCHIVOS PENDIENTES
 # =======================
 def obtener_archivos_pendientes() -> list:
-    """
-    Detecta CSV nuevos o modificados en la carpeta 'data'.
-    """
     conn = sqlite3.connect(METADATA_DB)
     cursor = conn.cursor()
     cursor.execute('SELECT archivo_nombre, hash_archivo FROM archivos_procesados')
@@ -71,8 +64,6 @@ def obtener_archivos_pendientes() -> list:
     
     for csv_file in csv_files:
         hash_actual = calcular_hash_archivo(csv_file)
-        
-        # Archivo nuevo o modificado
         if csv_file.name not in procesados or procesados[csv_file.name] != hash_actual:
             pendientes.append(csv_file)
     
@@ -101,73 +92,186 @@ def registrar_archivo_procesado(archivo_path: Path, filas: int, hash_archivo: st
     conn.close()
 
 # =======================
+# FUNCIÓN: DETECTAR ENCODING
+# =======================
+def detectar_encoding(csv_path: Path) -> str:
+    """
+    Intenta detectar el encoding correcto del CSV.
+    Visa puede usar: utf-8-sig, latin-1, windows-1252, iso-8859-1
+    """
+    encodings = ['utf-8-sig', 'utf-8', 'latin-1', 'windows-1252', 'iso-8859-1']
+    
+    for encoding in encodings:
+        try:
+            with open(csv_path, 'r', encoding=encoding) as f:
+                f.read(1000)  # Lee primeros 1000 caracteres
+            print(f"      ✅ Encoding detectado: {encoding}")
+            return encoding
+        except UnicodeDecodeError:
+            continue
+    
+    # Si todo falla, usar latin-1 (nunca falla pero puede dar caracteres raros)
+    print(f"      ⚠️ Usando encoding por defecto: latin-1")
+    return 'latin-1'
+
+# =======================
 # FUNCIÓN: LEER Y NORMALIZAR CSV
 # =======================
 def leer_csv_mar(csv_path: Path) -> pl.DataFrame:
     """
-    Lee CSV de Visa MAR con detección automática de estructura.
+    Lee CSV de Visa MAR con detección automática de encoding y estructura.
     """
     print(f"   📄 Leyendo: {csv_path.name}")
     
-    # Leer CSV
-    df = pl.read_csv(
-        str(csv_path),
-        quote_char='"',
-        infer_schema_length=10000,
-        ignore_errors=True,
-        encoding='utf-8-sig'  # Maneja BOM si Visa lo incluye
-    )
+    # Detectar encoding
+    encoding = detectar_encoding(csv_path)
+    
+    # Leer CSV con encoding correcto
+    try:
+        df = pl.read_csv(
+            str(csv_path),
+            quote_char='"',
+            infer_schema_length=10000,
+            ignore_errors=False,
+            encoding=encoding,
+            has_header=True
+        )
+    except Exception as e:
+        print(f"      ❌ Error leyendo CSV: {e}")
+        print(f"      ⚙️ Intentando sin headers...")
+        
+        # Si falla, leer sin header y asignar nombres manualmente
+        df = pl.read_csv(
+            str(csv_path),
+            quote_char='"',
+            infer_schema_length=10000,
+            ignore_errors=True,
+            encoding=encoding,
+            has_header=False
+        )
     
     print(f"      Columnas detectadas: {df.columns}")
     print(f"      Total filas: {len(df)}")
     
-    # Normalizar nombres de columnas
-    col_mapping = {
-        'Product ID - Account': 'Product_ID',
-        'Issuer BIN': 'Issuer_BIN',
-        'Authorization Response Code': 'Auth_Response_Full',
-        'Date': 'Date',
-        'Authorization Count': 'Authorization_Count'
-    }
-    
-    for old_name, new_name in col_mapping.items():
-        if old_name in df.columns:
-            df = df.rename({old_name: new_name})
-    
-    # Separar Auth_Response_Full si existe
-    if 'Auth_Response_Full' in df.columns:
-        df = df.with_columns([
-            pl.col('Auth_Response_Full')
-              .str.extract(r'^(\d+)', 1)
-              .fill_null("")
-              .alias('Auth_Code'),
+    # =======================
+    # NORMALIZACIÓN DE ESTRUCTURA
+    # =======================
+    # Caso 1: Si tiene headers normales
+    if 'Product ID - Account' in df.columns:
+        print(f"      ⚙️ Estructura: Headers estándar")
+        
+        # Renombrar
+        col_mapping = {
+            'Product ID - Account': 'Product_ID',
+            'Issuer BIN': 'Issuer_BIN'
+        }
+        
+        for old_name, new_name in col_mapping.items():
+            if old_name in df.columns:
+                df = df.rename({old_name: new_name})
+        
+        # Buscar columnas de Authorization
+        auth_cols = [col for col in df.columns if 'Authorization' in col or 'Auth' in col]
+        
+        if len(auth_cols) >= 2:
+            # Caso: código y descripción en columnas separadas
+            df = df.rename({
+                auth_cols[0]: 'Auth_Code',
+                auth_cols[1]: 'Auth_Description'
+            })
+        elif len(auth_cols) == 1:
+            # Caso: código y descripción juntos
+            df = df.rename({auth_cols[0]: 'Auth_Response_Full'})
             
-            pl.col('Auth_Response_Full')
-              .str.replace(r'^\d+\s*', '')
-              .fill_null("")
-              .alias('Auth_Description')
-        ])
-        df = df.drop('Auth_Response_Full')
+            df = df.with_columns([
+                pl.col('Auth_Response_Full')
+                  .str.extract(r'^(\d+)', 1)
+                  .fill_null("")
+                  .alias('Auth_Code'),
+                
+                pl.col('Auth_Response_Full')
+                  .str.replace(r'^\d+\s*', '')
+                  .fill_null("")
+                  .alias('Auth_Description')
+            ])
+            df = df.drop('Auth_Response_Full')
+        
+        # Renombrar Date y Authorization Count
+        if 'Date' in df.columns:
+            pass  # Ya está bien
+        
+        if 'Authorization Count' in df.columns:
+            df = df.rename({'Authorization Count': 'Authorization_Count'})
     
-    # Limpieza y tipado
+    # Caso 2: Sin headers o headers genéricos (column_1, column_2, etc.)
+    else:
+        print(f"      ⚙️ Estructura: Sin headers, asignando nombres...")
+        
+        # Asignar nombres basados en posición
+        # Estructura esperada: Product_ID, Account, Issuer_BIN, Auth_Code, Auth_Description, Columna_Vacia?, Date, Authorization_Count
+        
+        num_cols = len(df.columns)
+        
+        if num_cols == 8:
+            # Con columna vacía
+            df.columns = [
+                'Product_ID', 'Account', 'Issuer_BIN', 'Auth_Code', 
+                'Auth_Description', 'Columna_Vacia', 'Date', 'Authorization_Count'
+            ]
+            df = df.drop('Columna_Vacia')
+        elif num_cols == 7:
+            # Sin columna vacía
+            df.columns = [
+                'Product_ID', 'Account', 'Issuer_BIN', 'Auth_Code',
+                'Auth_Description', 'Date', 'Authorization_Count'
+            ]
+        elif num_cols == 6:
+            # Sin Account
+            df.columns = [
+                'Product_ID', 'Issuer_BIN', 'Auth_Code',
+                'Auth_Description', 'Date', 'Authorization_Count'
+            ]
+        else:
+            print(f"      ⚠️ Número de columnas inesperado: {num_cols}")
+            print(f"      Columnas: {df.columns}")
+    
+    # =======================
+    # LIMPIEZA FINAL
+    # =======================
+    # Eliminar columnas completamente vacías
+    cols_to_keep = []
+    for col in df.columns:
+        if not df[col].is_null().all():
+            cols_to_keep.append(col)
+    
+    df = df.select(cols_to_keep)
+    
+    # Verificar que tenemos las columnas esenciales
+    required_cols = ['Issuer_BIN', 'Auth_Code', 'Date', 'Authorization_Count']
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    
+    if missing_cols:
+        print(f"      ❌ Faltan columnas requeridas: {missing_cols}")
+        print(f"      Columnas disponibles: {df.columns}")
+        raise ValueError(f"Columnas faltantes: {missing_cols}")
+    
+    # Tipado robusto
     df = df.with_columns([
-        pl.col('Product_ID').str.strip_chars().cast(pl.Utf8),
-        pl.col('Issuer_BIN').str.strip_chars().cast(pl.Utf8),
-        pl.col('Auth_Code').str.strip_chars().cast(pl.Utf8),
-        pl.col('Auth_Description').str.strip_chars().cast(pl.Utf8),
+        pl.col('Product_ID').cast(pl.Utf8).fill_null("Unknown") if 'Product_ID' in df.columns else pl.lit("Unknown").alias('Product_ID'),
+        pl.col('Issuer_BIN').cast(pl.Utf8).str.strip_chars(),
+        pl.col('Auth_Code').cast(pl.Utf8).str.strip_chars(),
+        pl.col('Auth_Description').cast(pl.Utf8).str.strip_chars() if 'Auth_Description' in df.columns else pl.lit("").alias('Auth_Description'),
         pl.col('Date').str.strptime(pl.Date, '%d-%b-%Y', strict=False),
         pl.col('Authorization_Count').cast(pl.Int64)
     ])
     
+    print(f"      ✅ Lectura exitosa: {len(df)} filas")
     return df
 
 # =======================
 # FUNCIÓN: COMPOSITE KEY
 # =======================
 def agregar_composite_key(df: pl.DataFrame) -> pl.DataFrame:
-    """
-    Genera row_hash único: Date + Issuer_BIN + Auth_Code + Count
-    """
     df = df.with_columns(
         pl.concat_str([
             pl.col('Date').cast(pl.Utf8),
@@ -191,7 +295,6 @@ def agregar_composite_key(df: pl.DataFrame) -> pl.DataFrame:
 def procesar_bronze(csv_path: Path):
     df_raw = leer_csv_mar(csv_path)
     
-    # Agregar metadatos
     fecha_carga = datetime.now().strftime('%Y%m%d_%H%M%S')
     df_raw = df_raw.with_columns([
         pl.lit(csv_path.name).alias('archivo_origen'),
@@ -199,7 +302,6 @@ def procesar_bronze(csv_path: Path):
         pl.lit(datetime.now().isoformat()).alias('timestamp_carga')
     ])
     
-    # Guardar en Bronze
     bronze_file = BRONZE_PATH / f"mar_{csv_path.stem}_{fecha_carga}.parquet"
     df_raw.write_parquet(bronze_file)
     
@@ -209,35 +311,28 @@ def procesar_bronze(csv_path: Path):
 # =======================
 # PASO 2: SILVER
 # =======================
-def procesar_silver(df_new: pl.DataFrame, es_bootstrap: bool = False):
+def procesar_silver(df_new: pl.DataFrame):
     silver_file = SILVER_PATH / 'mar_silver.parquet'
     
-    # Leer histórico
-    if silver_file.exists() and not es_bootstrap:
+    if silver_file.exists():
         df_silver = pl.read_parquet(silver_file)
         print(f"   📂 Silver existente: {len(df_silver)} filas")
     else:
         df_silver = pl.DataFrame()
-        if es_bootstrap:
-            print(f"   📂 Iniciando Silver desde cero (bootstrap)")
+        print(f"   📂 Creando Silver nuevo")
     
-    # Agregar composite key
     df_new = agregar_composite_key(df_new)
     
-    # Combinar
     if len(df_silver) > 0:
         df_silver = agregar_composite_key(df_silver)
         df_combined = pl.concat([df_silver, df_new])
     else:
         df_combined = df_new
     
-    # Deduplicar
     df_silver_updated = df_combined.unique(subset=['row_hash'], keep='last')
-    
-    # Guardar
     df_silver_updated.write_parquet(silver_file)
-    print(f"   ✅ Silver: {len(df_silver_updated)} filas totales (+{len(df_new)} nuevas)")
     
+    print(f"   ✅ Silver: {len(df_silver_updated)} filas totales")
     return df_silver_updated
 
 # =======================
@@ -268,62 +363,38 @@ def main():
     print("\n" + "="*70)
     print("🚀 PIPELINE MAR - DECLINACIONES VISA")
     print("="*70)
-    print(f"📅 Fecha de ejecución: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"📅 Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"📂 Carpeta data: {DATA_PATH}")
     
-    # Inicializar metadata
     inicializar_metadata_db()
-    
-    # Detectar archivos pendientes
     archivos_pendientes = obtener_archivos_pendientes()
     
     if not archivos_pendientes:
-        print("\n✅ No hay archivos nuevos o modificados para procesar")
-        print(f"💡 Tip: Descarga el CSV de hoy y guárdalo en: {DATA_PATH}")
+        print("\n✅ No hay archivos nuevos para procesar")
         return
     
     print(f"\n📋 Archivos detectados: {len(archivos_pendientes)}")
     for idx, archivo in enumerate(archivos_pendientes, 1):
         print(f"   {idx}. {archivo.name}")
     
-    # Determinar si es bootstrap inicial
-    es_bootstrap = len(archivos_pendientes) == 3 and not (SILVER_PATH / 'mar_silver.parquet').exists()
+    print(f"\n🔄 Iniciando procesamiento...\n")
     
-    if es_bootstrap:
-        print(f"\n🔄 MODO: Bootstrap inicial (primera carga completa)")
-    else:
-        print(f"\n🔄 MODO: Carga incremental")
-    
-    # Procesar cada archivo
-    total_filas_nuevas = 0
+    total_filas = 0
+    df_gold = None  # Inicializar variable
     
     for idx, csv_file in enumerate(archivos_pendientes, 1):
-        print(f"\n{'─'*70}")
-        print(f"📥 [{idx}/{len(archivos_pendientes)}] Procesando: {csv_file.name}")
+        print(f"{'─'*70}")
+        print(f"📥 [{idx}/{len(archivos_pendientes)}] {csv_file.name}")
         print(f"{'─'*70}")
         
         try:
-            # Bronze
             df_bronze = procesar_bronze(csv_file)
+            df_silver = procesar_silver(df_bronze)
             
-            # Silver (solo el primero en bootstrap, o todos en incremental)
-            if idx == len(archivos_pendientes) or not es_bootstrap:
-                df_silver = procesar_silver(df_bronze, es_bootstrap=(idx==1 and es_bootstrap))
-            else:
-                # En bootstrap, acumular todos antes de crear Silver
-                if idx == 1:
-                    df_acumulado = df_bronze
-                else:
-                    df_acumulado = pl.concat([df_acumulado, df_bronze])
-                
-                if idx == len(archivos_pendientes):
-                    df_silver = procesar_silver(df_acumulado, es_bootstrap=True)
-            
-            # Registrar en metadata
             hash_archivo = calcular_hash_archivo(csv_file)
             registrar_archivo_procesado(csv_file, len(df_bronze), hash_archivo)
             
-            total_filas_nuevas += len(df_bronze)
+            total_filas += len(df_bronze)
             
         except Exception as e:
             print(f"   ❌ ERROR: {e}")
@@ -332,33 +403,33 @@ def main():
             continue
     
     # Gold final
-    if total_filas_nuevas > 0:
+    if total_filas > 0:
         print(f"\n{'─'*70}")
         print(f"🏆 Generando Gold final...")
         print(f"{'─'*70}")
         
         silver_file = SILVER_PATH / 'mar_silver.parquet'
-        df_silver = pl.read_parquet(silver_file)
-        df_gold = procesar_gold(df_silver)
+        if silver_file.exists():
+            df_silver = pl.read_parquet(silver_file)
+            df_gold = procesar_gold(df_silver)
     
     # Resumen
     print("\n" + "="*70)
     print("✅ PIPELINE COMPLETADO")
     print("="*70)
     print(f"📊 Archivos procesados: {len(archivos_pendientes)}")
-    print(f"📊 Filas procesadas: {total_filas_nuevas:,}")
-    print(f"📊 Total histórico: {len(df_gold):,} filas")
-    print(f"\n📂 Archivos generados:")
-    print(f"   • Bronze: {BRONZE_PATH}")
-    print(f"   • Silver: {SILVER_PATH / 'mar_silver.parquet'}")
-    print(f"   • Gold: {GOLD_PATH / 'mar_gold.parquet'}")
-    print(f"\n💡 Conecta Power BI a: {GOLD_PATH / 'mar_gold.parquet'}")
+    print(f"📊 Filas procesadas: {total_filas:,}")
+    if df_gold is not None:
+        print(f"📊 Total histórico: {len(df_gold):,} filas")
+        print(f"\n💡 Conecta Power BI a: {GOLD_PATH / 'mar_gold.parquet'}")
+    else:
+        print(f"\n⚠️ No se generó archivo Gold (verificar errores arriba)")
 
 if __name__ == '__main__':
     try:
         main()
     except KeyboardInterrupt:
-        print("\n\n⚠️ Proceso interrumpido por el usuario")
+        print("\n\n⚠️ Proceso interrumpido")
     except Exception as e:
         print(f"\n❌ ERROR CRÍTICO: {e}")
         import traceback
