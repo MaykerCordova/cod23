@@ -1,0 +1,170 @@
+# =======================
+# FUNCIÓN: LEER Y NORMALIZAR CSV
+# =======================
+def leer_csv_mar(csv_path: Path) -> pl.DataFrame:
+    """
+    Lee CSV de Visa MAR con detección automática de encoding y estructura.
+    """
+    print(f"   📄 Leyendo: {csv_path.name}")
+    
+    # Detectar encoding
+    encoding = detectar_encoding(csv_path)
+    
+    # Leer CSV con encoding correcto
+    try:
+        df = pl.read_csv(
+            str(csv_path),
+            quote_char='"',
+            infer_schema_length=10000,
+            ignore_errors=False,
+            encoding=encoding,
+            has_header=True
+        )
+    except Exception as e:
+        print(f"      ❌ Error leyendo CSV: {e}")
+        print(f"      ⚙️ Intentando sin headers...")
+        
+        df = pl.read_csv(
+            str(csv_path),
+            quote_char='"',
+            infer_schema_length=10000,
+            ignore_errors=True,
+            encoding=encoding,
+            has_header=False,
+            truncate_ragged_lines=True  # ⬅️ NUEVO: maneja filas con columnas extras
+        )
+    
+    print(f"      Columnas detectadas: {df.columns}")
+    print(f"      Total filas: {len(df)}")
+    
+    # =======================
+    # NORMALIZACIÓN DE ESTRUCTURA
+    # =======================
+    if 'Product ID - Account' in df.columns:
+        print(f"      ⚙️ Estructura: Headers estándar")
+        
+        col_mapping = {
+            'Product ID - Account': 'Product_ID',
+            'Issuer BIN': 'Issuer_BIN'
+        }
+        
+        for old_name, new_name in col_mapping.items():
+            if old_name in df.columns:
+                df = df.rename({old_name: new_name})
+        
+        auth_cols = [col for col in df.columns if 'Authorization' in col or 'Auth' in col]
+        
+        if len(auth_cols) >= 2:
+            df = df.rename({
+                auth_cols[0]: 'Auth_Code',
+                auth_cols[1]: 'Auth_Description'
+            })
+        elif len(auth_cols) == 1:
+            df = df.rename({auth_cols[0]: 'Auth_Response_Full'})
+            
+            df = df.with_columns([
+                pl.col('Auth_Response_Full')
+                  .str.extract(r'^(\d+)', 1)
+                  .fill_null("")
+                  .alias('Auth_Code'),
+                
+                pl.col('Auth_Response_Full')
+                  .str.replace(r'^\d+\s*', '')
+                  .fill_null("")
+                  .alias('Auth_Description')
+            ])
+            df = df.drop('Auth_Response_Full')
+        
+        if 'Authorization Count' in df.columns:
+            df = df.rename({'Authorization Count': 'Authorization_Count'})
+    
+    else:
+        print(f"      ⚙️ Estructura: Sin headers, asignando nombres...")
+        
+        num_cols = len(df.columns)
+        
+        if num_cols == 8:
+            df.columns = [
+                'Product_ID', 'Account', 'Issuer_BIN', 'Auth_Code', 
+                'Auth_Description', 'Columna_Vacia', 'Date', 'Authorization_Count'
+            ]
+            df = df.drop('Columna_Vacia')
+        elif num_cols == 7:
+            df.columns = [
+                'Product_ID', 'Account', 'Issuer_BIN', 'Auth_Code',
+                'Auth_Description', 'Date', 'Authorization_Count'
+            ]
+        elif num_cols == 6:
+            df.columns = [
+                'Product_ID', 'Issuer_BIN', 'Auth_Code',
+                'Auth_Description', 'Date', 'Authorization_Count'
+            ]
+        else:
+            print(f"      ⚠️ Número de columnas inesperado: {num_cols}")
+    
+    # Eliminar columnas completamente vacías
+    cols_to_keep = []
+    for col in df.columns:
+        if not df[col].is_null().all():
+            cols_to_keep.append(col)
+    
+    df = df.select(cols_to_keep)
+    
+    # Verificar columnas esenciales
+    required_cols = ['Issuer_BIN', 'Auth_Code', 'Date', 'Authorization_Count']
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    
+    if missing_cols:
+        print(f"      ❌ Faltan columnas requeridas: {missing_cols}")
+        print(f"      Columnas disponibles: {df.columns}")
+        raise ValueError(f"Columnas faltantes: {missing_cols}")
+    
+    # =======================
+    # TIPADO ROBUSTO CON LIMPIEZA DE STRINGS
+    # =======================
+    # CRÍTICO: Limpiar comillas y espacios antes de convertir a Int64
+    df = df.with_columns([
+        # Product_ID (opcional, puede no existir)
+        pl.col('Product_ID').cast(pl.Utf8).str.strip_chars().fill_null("Unknown") 
+            if 'Product_ID' in df.columns 
+            else pl.lit("Unknown").alias('Product_ID'),
+        
+        # Issuer_BIN (forzar a string, quitar comillas)
+        pl.col('Issuer_BIN')
+          .cast(pl.Utf8)
+          .str.strip_chars()
+          .str.replace_all('"', ''),  # ⬅️ Quitar comillas
+        
+        # Auth_Code (forzar a string, quitar comillas)
+        pl.col('Auth_Code')
+          .cast(pl.Utf8)
+          .str.strip_chars()
+          .str.replace_all('"', ''),
+        
+        # Auth_Description (opcional)
+        pl.col('Auth_Description')
+          .cast(pl.Utf8)
+          .str.strip_chars()
+          .str.replace_all('"', '')
+          .fill_null("")
+            if 'Auth_Description' in df.columns 
+            else pl.lit("").alias('Auth_Description'),
+        
+        # Date (parsear fecha)
+        pl.col('Date')
+          .cast(pl.Utf8)
+          .str.strip_chars()
+          .str.replace_all('"', '')
+          .str.strptime(pl.Date, '%d-%b-%Y', strict=False),
+        
+        # Authorization_Count (CRÍTICO: limpiar antes de convertir a entero)
+        pl.col('Authorization_Count')
+          .cast(pl.Utf8)               # ⬅️ Primero forzar a string
+          .str.strip_chars()           # ⬅️ Quitar espacios
+          .str.replace_all('"', '')    # ⬅️ Quitar comillas
+          .cast(pl.Int64, strict=False) # ⬅️ Luego convertir a entero (strict=False ignora errores)
+          .fill_null(0)                # ⬅️ Si falla, poner 0
+    ])
+    
+    print(f"      ✅ Lectura exitosa: {len(df)} filas")
+    return df
