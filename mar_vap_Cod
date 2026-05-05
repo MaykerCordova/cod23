@@ -3,31 +3,27 @@ from pathlib import Path
 from datetime import datetime
 import hashlib
 import sqlite3
-
+# mejora mike
 # =======================
 # CONFIGURACIÓN DE RUTAS
 # =======================
 BASE_PATH = Path(r'C:\Users\s4930359\Data_Herramientas\MAR')
-DATA_PATH = BASE_PATH / 'data'          # ⬅️ Carpeta donde tiras los CSV
+DATA_PATH = BASE_PATH / 'data'
 BRONZE_PATH = BASE_PATH / 'Bronze'
 SILVER_PATH = BASE_PATH / 'Silver'
 GOLD_PATH = BASE_PATH / 'Gold'
 METADATA_PATH = BASE_PATH / 'Metadata'
 
 # Crear carpetas si no existen
-for path in [DATA_PATH, BRONZE_PATH, SILVER_PATH, GOLD_PATH, METADATA_PATH]:
+for path in [BRONZE_PATH, SILVER_PATH, GOLD_PATH, METADATA_PATH]:
     path.mkdir(parents=True, exist_ok=True)
 
-# Base de datos SQLite para tracking
 METADATA_DB = METADATA_PATH / 'mar_metadata.db'
 
 # =======================
 # FUNCIÓN: INICIALIZAR METADATA DB
 # =======================
 def inicializar_metadata_db():
-    """
-    Crea tabla para trackear archivos procesados.
-    """
     conn = sqlite3.connect(METADATA_DB)
     cursor = conn.cursor()
     
@@ -36,7 +32,8 @@ def inicializar_metadata_db():
             archivo_nombre TEXT PRIMARY KEY,
             fecha_procesamiento TEXT,
             filas_procesadas INTEGER,
-            ruta_completa TEXT
+            ruta_completa TEXT,
+            hash_archivo TEXT
         )
     ''')
     
@@ -44,46 +41,60 @@ def inicializar_metadata_db():
     conn.close()
 
 # =======================
+# FUNCIÓN: CALCULAR HASH DE ARCHIVO
+# =======================
+def calcular_hash_archivo(filepath: Path) -> str:
+    """
+    Genera hash SHA-256 del contenido del archivo para detectar cambios.
+    """
+    sha256 = hashlib.sha256()
+    with open(filepath, 'rb') as f:
+        for chunk in iter(lambda: f.read(4096), b''):
+            sha256.update(chunk)
+    return sha256.hexdigest()
+
+# =======================
 # FUNCIÓN: OBTENER ARCHIVOS PENDIENTES
 # =======================
 def obtener_archivos_pendientes() -> list:
     """
-    Detecta CSV nuevos en la carpeta 'data' que no han sido procesados.
+    Detecta CSV nuevos o modificados en la carpeta 'data'.
     """
-    # Leer lista de archivos ya procesados
     conn = sqlite3.connect(METADATA_DB)
     cursor = conn.cursor()
-    cursor.execute('SELECT archivo_nombre FROM archivos_procesados')
-    procesados = {row[0] for row in cursor.fetchall()}
+    cursor.execute('SELECT archivo_nombre, hash_archivo FROM archivos_procesados')
+    procesados = {row[0]: row[1] for row in cursor.fetchall()}
     conn.close()
     
-    # Buscar todos los CSV en la carpeta data
     csv_files = sorted(DATA_PATH.glob('*.csv'))
+    pendientes = []
     
-    # Filtrar solo los que NO han sido procesados
-    pendientes = [f for f in csv_files if f.name not in procesados]
+    for csv_file in csv_files:
+        hash_actual = calcular_hash_archivo(csv_file)
+        
+        # Archivo nuevo o modificado
+        if csv_file.name not in procesados or procesados[csv_file.name] != hash_actual:
+            pendientes.append(csv_file)
     
     return pendientes
 
 # =======================
 # FUNCIÓN: REGISTRAR ARCHIVO PROCESADO
 # =======================
-def registrar_archivo_procesado(archivo_path: Path, filas: int):
-    """
-    Guarda en metadata DB que un archivo fue procesado.
-    """
+def registrar_archivo_procesado(archivo_path: Path, filas: int, hash_archivo: str):
     conn = sqlite3.connect(METADATA_DB)
     cursor = conn.cursor()
     
     cursor.execute('''
         INSERT OR REPLACE INTO archivos_procesados 
-        (archivo_nombre, fecha_procesamiento, filas_procesadas, ruta_completa)
-        VALUES (?, ?, ?, ?)
+        (archivo_nombre, fecha_procesamiento, filas_procesadas, ruta_completa, hash_archivo)
+        VALUES (?, ?, ?, ?, ?)
     ''', (
         archivo_path.name,
         datetime.now().isoformat(),
         filas,
-        str(archivo_path)
+        str(archivo_path),
+        hash_archivo
     ))
     
     conn.commit()
@@ -98,12 +109,17 @@ def leer_csv_mar(csv_path: Path) -> pl.DataFrame:
     """
     print(f"   📄 Leyendo: {csv_path.name}")
     
+    # Leer CSV
     df = pl.read_csv(
         str(csv_path),
         quote_char='"',
         infer_schema_length=10000,
-        ignore_errors=True
+        ignore_errors=True,
+        encoding='utf-8-sig'  # Maneja BOM si Visa lo incluye
     )
+    
+    print(f"      Columnas detectadas: {df.columns}")
+    print(f"      Total filas: {len(df)}")
     
     # Normalizar nombres de columnas
     col_mapping = {
@@ -118,25 +134,27 @@ def leer_csv_mar(csv_path: Path) -> pl.DataFrame:
         if old_name in df.columns:
             df = df.rename({old_name: new_name})
     
-    # Separar Auth_Response_Full en código y descripción
+    # Separar Auth_Response_Full si existe
     if 'Auth_Response_Full' in df.columns:
         df = df.with_columns([
             pl.col('Auth_Response_Full')
               .str.extract(r'^(\d+)', 1)
+              .fill_null("")
               .alias('Auth_Code'),
             
             pl.col('Auth_Response_Full')
               .str.replace(r'^\d+\s*', '')
+              .fill_null("")
               .alias('Auth_Description')
         ])
         df = df.drop('Auth_Response_Full')
     
     # Limpieza y tipado
     df = df.with_columns([
-        pl.col('Product_ID').str.strip().cast(pl.Utf8),
-        pl.col('Issuer_BIN').str.strip().cast(pl.Utf8),
-        pl.col('Auth_Code').str.strip().cast(pl.Utf8),
-        pl.col('Auth_Description').str.strip().cast(pl.Utf8),
+        pl.col('Product_ID').str.strip_chars().cast(pl.Utf8),
+        pl.col('Issuer_BIN').str.strip_chars().cast(pl.Utf8),
+        pl.col('Auth_Code').str.strip_chars().cast(pl.Utf8),
+        pl.col('Auth_Description').str.strip_chars().cast(pl.Utf8),
         pl.col('Date').str.strptime(pl.Date, '%d-%b-%Y', strict=False),
         pl.col('Authorization_Count').cast(pl.Int64)
     ])
@@ -148,7 +166,7 @@ def leer_csv_mar(csv_path: Path) -> pl.DataFrame:
 # =======================
 def agregar_composite_key(df: pl.DataFrame) -> pl.DataFrame:
     """
-    Genera row_hash único por fila.
+    Genera row_hash único: Date + Issuer_BIN + Auth_Code + Count
     """
     df = df.with_columns(
         pl.concat_str([
@@ -171,40 +189,37 @@ def agregar_composite_key(df: pl.DataFrame) -> pl.DataFrame:
 # PASO 1: BRONZE
 # =======================
 def procesar_bronze(csv_path: Path):
-    """
-    Lee CSV y guarda en Bronze con timestamp.
-    """
     df_raw = leer_csv_mar(csv_path)
     
     # Agregar metadatos
-    fecha_carga = datetime.now().strftime('%Y%m%d')
+    fecha_carga = datetime.now().strftime('%Y%m%d_%H%M%S')
     df_raw = df_raw.with_columns([
         pl.lit(csv_path.name).alias('archivo_origen'),
         pl.lit(fecha_carga).alias('fecha_carga'),
         pl.lit(datetime.now().isoformat()).alias('timestamp_carga')
     ])
     
-    # Guardar en Bronze (nombre basado en fecha del CSV o timestamp)
-    bronze_file = BRONZE_PATH / f"mar_{csv_path.stem}.parquet"
+    # Guardar en Bronze
+    bronze_file = BRONZE_PATH / f"mar_{csv_path.stem}_{fecha_carga}.parquet"
     df_raw.write_parquet(bronze_file)
     
-    print(f"   ✅ Bronze: {bronze_file.name} ({len(df_raw)} filas)")
+    print(f"   ✅ Bronze: {bronze_file.name}")
     return df_raw
 
 # =======================
 # PASO 2: SILVER
 # =======================
-def procesar_silver(df_new: pl.DataFrame):
-    """
-    Consolida histórico con deduplicación.
-    """
+def procesar_silver(df_new: pl.DataFrame, es_bootstrap: bool = False):
     silver_file = SILVER_PATH / 'mar_silver.parquet'
     
     # Leer histórico
-    if silver_file.exists():
+    if silver_file.exists() and not es_bootstrap:
         df_silver = pl.read_parquet(silver_file)
+        print(f"   📂 Silver existente: {len(df_silver)} filas")
     else:
         df_silver = pl.DataFrame()
+        if es_bootstrap:
+            print(f"   📂 Iniciando Silver desde cero (bootstrap)")
     
     # Agregar composite key
     df_new = agregar_composite_key(df_new)
@@ -221,15 +236,14 @@ def procesar_silver(df_new: pl.DataFrame):
     
     # Guardar
     df_silver_updated.write_parquet(silver_file)
+    print(f"   ✅ Silver: {len(df_silver_updated)} filas totales (+{len(df_new)} nuevas)")
+    
     return df_silver_updated
 
 # =======================
 # PASO 3: GOLD
 # =======================
 def procesar_gold(df_silver: pl.DataFrame):
-    """
-    Genera versión final para Power BI.
-    """
     df_gold = df_silver.select([
         'Date',
         'Product_ID',
@@ -244,77 +258,107 @@ def procesar_gold(df_silver: pl.DataFrame):
     gold_file = GOLD_PATH / 'mar_gold.parquet'
     df_gold.write_parquet(gold_file)
     
+    print(f"   ✅ Gold: {len(df_gold)} filas")
     return df_gold
 
 # =======================
 # EJECUCIÓN PRINCIPAL
 # =======================
 def main():
-    """
-    Pipeline completo con detección automática de archivos.
-    """
-    print("\n" + "="*60)
-    print("🚀 INICIANDO PIPELINE MAR - DECLINACIONES")
-    print("="*60)
+    print("\n" + "="*70)
+    print("🚀 PIPELINE MAR - DECLINACIONES VISA")
+    print("="*70)
+    print(f"📅 Fecha de ejecución: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"📂 Carpeta data: {DATA_PATH}")
     
-    # Inicializar base de datos de metadata
+    # Inicializar metadata
     inicializar_metadata_db()
     
     # Detectar archivos pendientes
     archivos_pendientes = obtener_archivos_pendientes()
     
     if not archivos_pendientes:
-        print("\n✅ No hay archivos nuevos para procesar")
-        print(f"📂 Carpeta monitoreada: {DATA_PATH}")
+        print("\n✅ No hay archivos nuevos o modificados para procesar")
+        print(f"💡 Tip: Descarga el CSV de hoy y guárdalo en: {DATA_PATH}")
         return
     
     print(f"\n📋 Archivos detectados: {len(archivos_pendientes)}")
-    for archivo in archivos_pendientes:
-        print(f"   • {archivo.name}")
+    for idx, archivo in enumerate(archivos_pendientes, 1):
+        print(f"   {idx}. {archivo.name}")
+    
+    # Determinar si es bootstrap inicial
+    es_bootstrap = len(archivos_pendientes) == 3 and not (SILVER_PATH / 'mar_silver.parquet').exists()
+    
+    if es_bootstrap:
+        print(f"\n🔄 MODO: Bootstrap inicial (primera carga completa)")
+    else:
+        print(f"\n🔄 MODO: Carga incremental")
     
     # Procesar cada archivo
     total_filas_nuevas = 0
     
-    for csv_file in archivos_pendientes:
-        print(f"\n📥 Procesando: {csv_file.name}")
+    for idx, csv_file in enumerate(archivos_pendientes, 1):
+        print(f"\n{'─'*70}")
+        print(f"📥 [{idx}/{len(archivos_pendientes)}] Procesando: {csv_file.name}")
+        print(f"{'─'*70}")
         
         try:
-            # Bronze: leer y guardar raw
+            # Bronze
             df_bronze = procesar_bronze(csv_file)
             
-            # Silver: consolidar histórico
-            df_silver = procesar_silver(df_bronze)
+            # Silver (solo el primero en bootstrap, o todos en incremental)
+            if idx == len(archivos_pendientes) or not es_bootstrap:
+                df_silver = procesar_silver(df_bronze, es_bootstrap=(idx==1 and es_bootstrap))
+            else:
+                # En bootstrap, acumular todos antes de crear Silver
+                if idx == 1:
+                    df_acumulado = df_bronze
+                else:
+                    df_acumulado = pl.concat([df_acumulado, df_bronze])
+                
+                if idx == len(archivos_pendientes):
+                    df_silver = procesar_silver(df_acumulado, es_bootstrap=True)
             
             # Registrar en metadata
-            registrar_archivo_procesado(csv_file, len(df_bronze))
+            hash_archivo = calcular_hash_archivo(csv_file)
+            registrar_archivo_procesado(csv_file, len(df_bronze), hash_archivo)
             
             total_filas_nuevas += len(df_bronze)
             
         except Exception as e:
-            print(f"   ❌ ERROR procesando {csv_file.name}: {e}")
+            print(f"   ❌ ERROR: {e}")
+            import traceback
+            traceback.print_exc()
             continue
     
-    # Gold: generar versión final consolidada
+    # Gold final
     if total_filas_nuevas > 0:
-        print(f"\n🏆 Generando Gold final...")
+        print(f"\n{'─'*70}")
+        print(f"🏆 Generando Gold final...")
+        print(f"{'─'*70}")
+        
         silver_file = SILVER_PATH / 'mar_silver.parquet'
         df_silver = pl.read_parquet(silver_file)
         df_gold = procesar_gold(df_silver)
-        
-        print(f"   ✅ Gold actualizado: {len(df_gold)} filas totales")
     
-    # Resumen final
-    print("\n" + "="*60)
+    # Resumen
+    print("\n" + "="*70)
     print("✅ PIPELINE COMPLETADO")
-    print("="*60)
+    print("="*70)
     print(f"📊 Archivos procesados: {len(archivos_pendientes)}")
-    print(f"📊 Filas nuevas: {total_filas_nuevas}")
-    print(f"📂 Archivo final: {GOLD_PATH / 'mar_gold.parquet'}")
-    print(f"📂 Conecta Power BI a: {GOLD_PATH}")
+    print(f"📊 Filas procesadas: {total_filas_nuevas:,}")
+    print(f"📊 Total histórico: {len(df_gold):,} filas")
+    print(f"\n📂 Archivos generados:")
+    print(f"   • Bronze: {BRONZE_PATH}")
+    print(f"   • Silver: {SILVER_PATH / 'mar_silver.parquet'}")
+    print(f"   • Gold: {GOLD_PATH / 'mar_gold.parquet'}")
+    print(f"\n💡 Conecta Power BI a: {GOLD_PATH / 'mar_gold.parquet'}")
 
 if __name__ == '__main__':
     try:
         main()
+    except KeyboardInterrupt:
+        print("\n\n⚠️ Proceso interrumpido por el usuario")
     except Exception as e:
         print(f"\n❌ ERROR CRÍTICO: {e}")
         import traceback
