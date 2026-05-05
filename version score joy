@@ -1,0 +1,74 @@
+# ══════════════════════════════════════════════════════
+# SCORE V3 — Incorporando CANAL_JOY
+# ══════════════════════════════════════════════════════
+
+df_score3 = df_eval.with_columns(
+    df.select("CANAL_JOY")
+).with_columns(
+    pl.col("HORA_TRX").cast(pl.Utf8).str.zfill(6)
+    .str.slice(0, 2).cast(pl.Int32).alias("hora_int")
+).with_columns([
+
+    # Historial
+    pl.when(pl.col("CNT_MES_PREVIO") == 0).then(40)
+    .when(pl.col("CNT_MES_PREVIO") <= 2).then(20)
+    .otherwise(0).alias("pts_historial"),
+
+    # Vaciado
+    pl.when(pl.col("ratio_vaciado") >= 0.95).then(35)
+    .when(pl.col("ratio_vaciado") >= 0.80).then(20)
+    .when(pl.col("ratio_vaciado") >= 0.50).then(10)
+    .otherwise(0).alias("pts_vaciado"),
+
+    # Frecuencia destino
+    pl.when(pl.col("freq_destino") == 1).then(25)
+    .when(pl.col("freq_destino") <= 3).then(10)
+    .otherwise(0).alias("pts_destino"),
+
+    # Canal Joy — Web es 4x más riesgoso
+    pl.when(pl.col("CANAL_JOY") == "JOY WEB").then(30)
+    .when(pl.col("CANAL_JOY") == "JOY APP ANDROID").then(5)
+    .otherwise(0).alias("pts_canal"),
+
+]).with_columns(
+    (pl.col("pts_historial") +
+     pl.col("pts_vaciado") +
+     pl.col("pts_destino") +
+     pl.col("pts_canal"))
+    .alias("score_v3")
+)
+
+# Evaluación por umbral
+print(f"{'Umbral':>8} | {'Trx act':>8} | {'% total':>7} | "
+      f"{'Fraudes':>7} | {'Recall':>7} | {'Precisión':>10} | {'Monto prot.':>12}")
+print("─" * 75)
+
+for umbral in [50, 60, 70, 80, 90, 100, 110]:
+    act  = df_score3.filter(pl.col("score_v3") >= umbral)
+    f    = act.filter(pl.col("es_fraude")).height
+    tot  = act.height
+    if tot == 0:
+        continue
+    prec  = f / tot * 100
+    rec   = f / total_fraude * 100
+    pct   = tot / total_trx * 100
+    monto = act.filter(pl.col("es_fraude"))["MONTO"].sum() if f > 0 else 0
+    print(f"  >= {umbral:3d}  | {tot:>8,} | {pct:>6.3f}% | "
+          f"{f:>7} | {rec:>6.1f}% | {prec:>9.2f}% | S/{monto:>10,.0f}")
+
+# Comparación con score anterior
+print("\n=== Comparación v2 vs v3 al mismo recall ===")
+for umbral in [80, 90]:
+    act2 = df_score.filter(pl.col("score_riesgo") >= umbral)
+    act3 = df_score3.filter(pl.col("score_v3") >= umbral)
+    f2 = act2.filter(pl.col("es_fraude")).height
+    f3 = act3.filter(pl.col("es_fraude")).height
+    print(f"\n  Umbral >= {umbral}:")
+    print(f"  Score v2 → {act2.height:,} trx  |  {f2} fraudes")
+    print(f"  Score v3 → {act3.height:,} trx  |  {f3} fraudes")
+
+# Score v3 en fraudes vs no fraudes
+print("\nScore v3 en FRAUDES:")
+print(df_score3.filter(pl.col("es_fraude")).select("score_v3").describe())
+print("\nScore v3 en NO FRAUDES:")
+print(df_score3.filter(~pl.col("es_fraude")).select("score_v3").describe())
