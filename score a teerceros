@@ -1,0 +1,68 @@
+# ══════════════════════════════════════════════════════
+# SCORE DE RIESGO — En lugar de reglas binarias
+# Cada señal suma puntos → priorizas la cola más riesgosa
+# ══════════════════════════════════════════════════════
+
+df_score = df_eval.with_columns([
+
+    # Señal 1: Sin historial el mes anterior (señal más fuerte)
+    pl.when(pl.col("CNT_MES_PREVIO") == 0)
+      .then(40)
+      .when(pl.col("CNT_MES_PREVIO") <= 2)
+      .then(20)
+      .otherwise(0)
+      .alias("pts_historial"),
+
+    # Señal 2: Vaciado de cuenta
+    pl.when(pl.col("ratio_vaciado") >= 0.95)
+      .then(35)
+      .when(pl.col("ratio_vaciado") >= 0.80)
+      .then(20)
+      .when(pl.col("ratio_vaciado") >= 0.50)
+      .then(10)
+      .otherwise(0)
+      .alias("pts_vaciado"),
+
+    # Señal 3: Destino poco frecuente
+    pl.when(pl.col("freq_destino") == 1)
+      .then(25)
+      .when(pl.col("freq_destino") <= 3)
+      .then(10)
+      .otherwise(0)
+      .alias("pts_destino"),
+
+]).with_columns(
+    (pl.col("pts_historial") +
+     pl.col("pts_vaciado") +
+     pl.col("pts_destino"))
+    .alias("score_riesgo")
+)
+
+# ── Evaluar score por umbral ────────────────────────────
+print("Score de riesgo — evaluación por umbral\n")
+print(f"{'Umbral':>8} | {'Trx act':>8} | {'% total':>7} | "
+      f"{'Fraudes':>8} | {'Recall':>7} | {'Precisión':>10} | {'Monto prot.':>12}")
+print("─" * 75)
+
+for umbral in [50, 60, 70, 80, 90, 100]:
+    mask = pl.col("score_riesgo") >= umbral
+    act  = df_score.filter(mask)
+    f    = act.filter(pl.col("es_fraude")).height
+    tot  = act.height
+    if tot == 0:
+        continue
+    prec  = f / tot * 100
+    rec   = f / total_fraude * 100
+    pct   = tot / total_trx * 100
+    monto = act.filter(pl.col("es_fraude"))["MONTO"].sum() if f > 0 else 0
+    print(f"  >= {umbral:3d}  | {tot:>8,} | {pct:>6.3f}% | "
+          f"{f:>8} | {rec:>6.1f}% | {prec:>9.2f}% | S/{monto:>10,.0f}")
+
+# ── Ver distribución del score en fraudes vs no fraudes ─
+print("\n\nDistribución del score en FRAUDES:")
+print(df_score.filter(pl.col("es_fraude"))
+      .select("score_riesgo").describe())
+
+print("\nDistribución del score en NO FRAUDES (muestra 1%):")
+print(df_score.filter(~pl.col("es_fraude"))
+      .select("score_riesgo").describe())
