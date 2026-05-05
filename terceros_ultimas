@@ -1,0 +1,13 @@
+print("=== CANAL ===")
+canal_f = fraudes.group_by("CANAL").agg(
+    pl.len().alias("fraudes"),
+    pl.col("MONTO").sum().alias("monto_expuesto")
+)
+canal_t = df.group_by("CANAL").agg(pl.len().alias("total"))
+print(
+    canal_f.join(canal_t, on="CANAL", how="left")
+    .with_columns(
+        (pl.col("fraudes") / pl.col("total") * 100).round(4).alias("fraud_rate_%")
+    )
+    .sort("fraudes", descending=True)
+)
