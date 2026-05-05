@@ -1,0 +1,36 @@
+# ══════════════════════════════════════════════════════
+# FRAUDE POR CANAL JOY
+# ══════════════════════════════════════════════════════
+
+# Unir CANAL_JOY al df_eval
+canal_joy_map = df.select(["CUENTA", "CANAL_JOY"]) # ajusta si el join key es otro
+df_eval2 = df_eval.with_columns(
+    df["CANAL_JOY"]  # si CANAL_JOY ya está en df, lo jalamos directo
+)
+
+# Si CANAL_JOY ya está en df, simplemente:
+canal_f = (
+    df_eval.with_columns(df.select("CANAL_JOY"))
+    .filter(pl.col("es_fraude"))
+    .group_by("CANAL_JOY")
+    .agg(
+        pl.len().alias("fraudes"),
+        pl.col("MONTO").sum().alias("monto_fraude")
+    )
+)
+
+canal_t = (
+    df_eval.with_columns(df.select("CANAL_JOY"))
+    .group_by("CANAL_JOY")
+    .agg(pl.len().alias("total"))
+)
+
+print("=== FRAUDE POR CANAL JOY ===")
+print(
+    canal_f.join(canal_t, on="CANAL_JOY", how="left")
+    .with_columns([
+        (pl.col("fraudes") / pl.col("total") * 100).round(4).alias("fraud_rate_%"),
+        (pl.col("fraudes") / 42 * 100).round(1).alias("pct_del_fraude_total")
+    ])
+    .sort("fraudes", descending=True)
+)
