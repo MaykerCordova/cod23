@@ -1,0 +1,88 @@
+// ============================================
+// MEDIDAS BASE
+// ============================================
+
+// Total declinaciones
+declinaciones = SUM(data[Authorization Count])
+
+// Declinaciones mes anterior
+Declinaciones Mes Anterior = 
+CALCULATE(
+    [declinaciones],
+    DATEADD(dim_calendario[Date], -1, MONTH)
+)
+
+// ============================================
+// VARIACIÓN % MES A MES
+// ============================================
+
+// Variación numérica
+Var %MoM = 
+VAR MesActual = [declinaciones]
+VAR MesAnterior = [Declinaciones Mes Anterior]
+RETURN
+    IF(
+        ISBLANK(MesAnterior) || MesAnterior = 0,
+        BLANK(),
+        DIVIDE(MesActual - MesAnterior, MesAnterior, 0)
+    )
+
+// Variación con flecha e ícono (para visualización)
+Var %MoM Flecha = 
+VAR Variacion = [Var %MoM]
+VAR Simbolo = 
+    SWITCH(
+        TRUE(),
+        Variacion > 0, "▲ ",
+        Variacion < 0, "▼ ",
+        "― "
+    )
+RETURN
+    IF(
+        ISBLANK(Variacion),
+        BLANK(),
+        Simbolo & FORMAT(Variacion, "+#,0.0%;-#,0.0%;0.0%")
+    )
+
+// Color condicional
+Var %MoM Color = 
+VAR Variacion = [Var %MoM]
+RETURN
+    SWITCH(
+        TRUE(),
+        ISBLANK(Variacion), "#808080",       // Gris
+        Variacion > 0.05, "#D32F2F",         // Rojo fuerte (malo)
+        Variacion > 0, "#FF6B6B",            // Rojo claro
+        Variacion > -0.05, "#81C784",        // Verde claro (bueno)
+        "#2E7D32"                            // Verde fuerte
+    )
+
+// ============================================
+// VARIACIÓN ABSOLUTA (opcional)
+// ============================================
+
+Var Absoluta MoM = 
+VAR MesActual = [declinaciones]
+VAR MesAnterior = [Declinaciones Mes Anterior]
+RETURN
+    IF(
+        ISBLANK(MesAnterior),
+        BLANK(),
+        MesActual - MesAnterior
+    )
+
+Var Absoluta MoM Flecha = 
+VAR Variacion = [Var Absoluta MoM]
+VAR Simbolo = 
+    SWITCH(
+        TRUE(),
+        Variacion > 0, "▲ ",
+        Variacion < 0, "▼ ",
+        "― "
+    )
+RETURN
+    IF(
+        ISBLANK(Variacion),
+        BLANK(),
+        Simbolo & FORMAT(Variacion, "+#,##0;-#,##0;0")
+    )
