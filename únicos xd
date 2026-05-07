@@ -1,0 +1,21 @@
+Ranking_Intento = 
+RANKX(
+    FILTER(
+        Declinaciones,
+        Declinaciones[tarjeta] = EARLIER(Declinaciones[tarjeta]) &&
+        Declinaciones[comercio] = EARLIER(Declinaciones[comercio]) &&
+        Declinaciones[fecha_trx] = EARLIER(Declinaciones[fecha_trx])
+    ),
+    Declinaciones[hora_trx],
+    ,
+    ASC,
+    DENSE
+)
+
+
+
+Monto_Declinado_Unico = 
+CALCULATE(
+    SUM(Declinaciones[monto]),
+    Declinaciones[Ranking_Intento] = 1
+)
