@@ -67,13 +67,9 @@ FOLDER_MON_JOY   = "monitor_joy"
 # ── Destinatarios ─────────────────────────────────────────────────────────────
 TO_TRANS = (
     "roberto.palacios@scotiabank.com.pe; "
-    "Katherine.huapaya@scotiabank.com.pe; "
-    "rodolfo.cordova@scotiabank.com.pe"
 )
 TO_JOY   = (
     "roberto.palacios@scotiabank.com.pe; "
-    "Katherine.huapaya@scotiabank.com.pe; "
-    "rodolfo.cordova@scotiabank.com.pe"
 )
 
 # ── Parámetros ────────────────────────────────────────────────────────────────
