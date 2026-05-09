@@ -551,25 +551,26 @@ def _extraer_excel_adjunto(mail_item) -> tuple[pd.DataFrame | None, str | None]:
 
 # ── 2B. Parseo del cuerpo de correo Monitor JOY ────────────────────────────
 
-def _parsear_cuerpo_monitor_joy(body: str) -> dict[str, int]:
+def _parsear_cuerpo_monitor_joy(body: str) -> dict[str, tuple[int, str]]:
     """
     Parsea el cuerpo del correo de Monitor JOY.
 
-    Formato esperado (puede repetirse por código compuesto):
+    Formato esperado:
         (IO01) - Transferencias InterOperabilidad : 10,452
         (WJ33+WJ35+JN05) - Pagos de Servicios    : 25,699
 
-    Retorna dict {codigo_raw: cantidad}
-    Ejemplo: {"IO01": 10452, "WJ33+WJ35+JN05": 25699}
+    Retorna dict {codigo_raw: (cantidad, descripcion)}
+    Ejemplo: {"IO01": (10452, "Transferencias InterOperabilidad")}
     """
-    resultado: dict[str, int] = {}
-    # Patrón: (CODIGO) cualquier texto : número
-    patron = re.compile(r'\(([^)]+)\)[^:]+:\s*([\d,\.]+)')
+    resultado = {}
+    # 3 grupos: (1) código, (2) descripción, (3) cantidad
+    patron = re.compile(r'\(([^)]+)\)\s*-\s*([^:]+?)\s*:\s*([\d,\.]+)')
     for match in patron.finditer(body):
-        codigo = match.group(1).strip()
+        codigo      = match.group(1).strip()
+        descripcion = match.group(2).strip()
         try:
-            cantidad = int(match.group(2).replace(",", "").replace(".", ""))
-            resultado[codigo] = cantidad
+            cantidad = int(match.group(3).replace(",", "").replace(".", ""))
+            resultado[codigo] = (cantidad, descripcion)
         except ValueError:
             continue
     return resultado
@@ -578,7 +579,7 @@ def _parsear_cuerpo_monitor_joy(body: str) -> dict[str, int]:
 # ── 2C. Cálculo de diferencias ─────────────────────────────────────────────
 
 def _calcular_diferencias_joy(df_excel: pd.DataFrame,
-                               monitor_dict: dict[str, int]) -> pd.DataFrame:
+                               monitor_dict: dict[str, tuple]) -> pd.DataFrame:
     """
     Compara Excel JOY vs dict Monitor por código.
 
@@ -591,25 +592,18 @@ def _calcular_diferencias_joy(df_excel: pd.DataFrame,
     """
     registros = []
 
-    for cod_monitor, qty_monitor in monitor_dict.items():
+    for cod_monitor, (qty_monitor, desc_monitor) in monitor_dict.items():
         sub_codigos = [c.strip() for c in cod_monitor.split("+")]
 
-        # Suma Excel para los sub-códigos encontrados
-        mask = df_excel["COD_TRANSACCION"].isin(sub_codigos)
-        df_match = df_excel[mask]
-        qty_joy = int(df_match["TOTAL_CARGO_CUENTA"].sum())
-
-        # Descripción (primera encontrada)
-        desc = cod_monitor  # fallback
-        if not df_match.empty and "DESCRIPCION_TRANSACCION" in df_match.columns:
-            desc = df_match.iloc[0]["DESCRIPCION_TRANSACCION"]
+        mask    = df_excel["COD_TRANSACCION"].isin(sub_codigos)
+        qty_joy = int(df_excel[mask]["TOTAL_CARGO_CUENTA"].sum())
 
         diff = qty_joy - qty_monitor
         pct  = round(diff / qty_monitor * 100, 4) if qty_monitor != 0 else 0.0
 
         registros.append({
             "COD_TRANSACCION":  cod_monitor,
-            "DESCRIPCION":      desc,
+            "DESCRIPCION":      desc_monitor,  # ← viene del correo Monitor
             "TOTAL_JOY":        qty_joy,
             "TOTAL_MONITOR":    qty_monitor,
             "DIFERENCIA":       diff,
@@ -617,7 +611,6 @@ def _calcular_diferencias_joy(df_excel: pd.DataFrame,
         })
 
     return pd.DataFrame(registros)
-
 
 # ── 2D. Orquestador Proceso 2 ──────────────────────────────────────────────
 
