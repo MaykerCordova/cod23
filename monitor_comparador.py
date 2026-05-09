@@ -704,7 +704,7 @@ def run_proceso_joy(ns) -> bool:
 
         # Totales del día
         total_joy     = int(df_excel["TOTAL_CARGO_CUENTA"].sum())
-        total_monitor = sum(monitor_dict.values())
+        total_monitor = sum(qty for qty, _ in monitor_dict.values())
         diff          = total_joy - total_monitor
         pct           = round(diff / total_monitor * 100, 4) if total_monitor != 0 else 0.0
 
