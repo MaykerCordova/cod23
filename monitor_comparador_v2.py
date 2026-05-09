@@ -763,7 +763,7 @@ def _calcular_diferencias_joy(df_excel: pd.DataFrame, monitor_dict: dict) -> pd.
 # ── Email JOY ─────────────────────────────────────────────────────────────────
 
 def _bloque_html_joy(fila: pd.Series) -> str:
-    fecha_str = pd.to_datetime(fila["FECHA"]).strftime("%d/%m/%Y")
+    fecha_str = pd.to_datetime(fila.get("FECHA") or fila.get("Fecha")).strftime("%d/%m/%Y")
     joy  = int(fila["TOTAL_JOY"])
     mon  = int(fila["TOTAL_MONITOR"])
     diff = int(fila["DIFERENCIA"])
@@ -930,6 +930,8 @@ def run_proceso_joy() -> bool:
     # Histórico completo para gráficos
     df_hist = pd.read_excel(RUTA_EXCEL_JOY, sheet_name="DIARIO")
     df_hist["FECHA"] = pd.to_datetime(df_hist["FECHA"])
+    # Renombrar para compatibilidad con funciones de gráfico
+    df_hist = df_hist.rename(columns={"FECHA": "Fecha"})
 
     img1 = _plot_diario_log(
         df_hist=df_hist, col_diff="DIFERENCIA", lbl_diff="Diferencia",
