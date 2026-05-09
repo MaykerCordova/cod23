@@ -163,16 +163,17 @@ def guardar_en_bitacora(path_excel: str, df_nuevo: pd.DataFrame, hoja: str):
             df_total = pd.concat([df_existente, df_nuevo], ignore_index=True)
         except Exception:
             df_total = df_nuevo.copy()
-        mode = "a"
-        if_sheet = "replace"
+
+        with pd.ExcelWriter(path_excel, engine="openpyxl",
+                            mode="a", if_sheet_exists="replace") as writer:
+            df_total.to_excel(writer, sheet_name=hoja, index=False)
+
     else:
         df_total = df_nuevo.copy()
-        mode = "w"
-        if_sheet = "replace"
 
-    with pd.ExcelWriter(path_excel, engine="openpyxl",
-                        mode=mode, if_sheet_exists=if_sheet) as writer:
-        df_total.to_excel(writer, sheet_name=hoja, index=False)
+        with pd.ExcelWriter(path_excel, engine="openpyxl",
+                            mode="w") as writer:
+            df_total.to_excel(writer, sheet_name=hoja, index=False)
 
     print(f"  [BITACORA] {os.path.basename(path_excel)} | hoja={hoja} | +{len(df_nuevo)} fila(s)")
 
