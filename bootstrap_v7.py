@@ -21,15 +21,36 @@ import pandas as pd
 import os
 from datetime import datetime
 
-# ── RUTAS (igual que en bitacoraV7.py) ────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+# ▶  CONFIGURACIÓN — EDITAR ANTES DE CORRER
+# ══════════════════════════════════════════════════════════════════
+
+# RUTA_EXCEL → tu Excel corregido manualmente.
+#   Puede estar en cualquier carpeta. Si lo tienes en el escritorio:
+#   r"C:\Users\s4930359\Desktop\Bitacora_Master_corregido.xlsx"
+#   Si ya está en OneDrive con el nombre original:
+#   r"C:\Users\s4930359\OneDrive - The Bank of Nova Scotia\Bitacora_Reglas\Bitacora_Master.xlsx"
 RUTA_EXCEL = (
     r"C:\Users\s4930359\OneDrive - The Bank of Nova Scotia"
     r"\Bitacora_Reglas\Bitacora_Master.xlsx"
+    # ↑ Cambia esto si tu Excel corregido está en otra ruta
 )
+
+# RUTA_SQLITE → puede ser el mismo Respaldo_Blindado.db antiguo.
+#   El modo RESET (abajo) lo limpia antes de cargar, así que
+#   no necesitas crear un archivo nuevo.
 RUTA_SQLITE = (
     r"C:\Users\s4930359\OneDrive - The Bank of Nova Scotia"
     r"\Bitacora_Reglas\Respaldo_Blindado.db"
 )
+
+# MODO_RESET → True  = borra los datos viejos del SQLite y carga
+#                      todo desde el Excel corregido (recomendado
+#                      cuando el SQLite tiene errores como el 300.0)
+#            → False = solo agrega los que no existen (INSERT OR IGNORE)
+#                      útil si el SQLite ya está limpio y solo quieres
+#                      agregar los que faltan
+MODO_RESET = True   # ← déjalo en True para la migración inicial
 
 # ── COLUMNAS esperadas en el Excel (orden V7) ──────────────────────
 COLUMNAS_ESPERADAS = [
@@ -187,7 +208,16 @@ def main():
 
         # Estado actual del SQLite antes de migrar
         ya_en_db = conn.execute("SELECT COUNT(*) FROM Bitacora").fetchone()[0]
-        print(f"  ℹ️  Registros ya en SQLite antes del bootstrap: {ya_en_db}")
+        print(f"  ℹ️  Registros en SQLite antes del bootstrap: {ya_en_db}")
+
+        # ── MODO RESET: limpiar datos viejos antes de cargar ───────
+        if MODO_RESET and ya_en_db > 0:
+            print(f"\n  🗑️  MODO_RESET = True → borrando {ya_en_db} registros antiguos...")
+            conn.execute("DELETE FROM Bitacora")
+            conn.commit()
+            print(f"  ✔  SQLite limpio. Cargando desde Excel corregido...")
+        elif not MODO_RESET:
+            print(f"  ℹ️  MODO_RESET = False → solo se agregarán registros nuevos.")
 
         # ── Insertar fila por fila con INSERT OR IGNORE ────────────
         insertados  = 0
