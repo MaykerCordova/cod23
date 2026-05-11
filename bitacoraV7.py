@@ -20,7 +20,7 @@
 ║  7. Backup .msg de correos se mantiene igual                    ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
-
+# mejorar para la version 7
 import os
 import re
 import sqlite3
