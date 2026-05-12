@@ -645,11 +645,15 @@ def main():
                 }
 
                 # ── 8. Guardar ─────────────────────────────────────
+                # Primero guardar el .msg para capturar la ruta real
+                # y almacenarla en Sustento antes de insertar en SQLite
+                ruta_msg         = outlook.guardar_msg(m, f"REQ_{id_sys}")
+                fila["Sustento"] = ruta_msg
                 sql.insertar_solicitud(fila)
-                outlook.guardar_msg(m, f"REQ_{id_sys}")
                 m.UnRead = False
                 cambios  += 1
-                print(f"  ✔  Correlativo asignado: {correlativo:03d}\n")
+                print(f"  ✔  Correlativo asignado: {correlativo:04d}")
+                print(f"  📎 MSG guardado: {ruta_msg}\n")
 
             except Exception as e:
                 print(f"  ▲ Error en solicitud [{getattr(m, 'Subject', '?')[:60]}]: {e}")
