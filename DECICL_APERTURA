@@ -1,0 +1,27 @@
+# Apertura del Decil 10 (top monto)
+print("\nApertura del Decil 10 (top monto):")
+monto_d10_min = df["MONTO"].quantile(0.90)
+df_d10 = df[df["MONTO"] >= monto_d10_min].copy()
+
+# Intentar con 10 deciles, reducir si hay duplicados
+for n in [10, 8, 6, 5]:
+    try:
+        tabla_d10 = construir_tabla_deciles(df_d10, n_deciles=n, label="D")
+        print(f"  (Apertura con {n} grupos — ajustado por valores repetidos)")
+        break
+    except ValueError:
+        continue
+else:
+    # Si ningún qcut funciona, usar cortes fijos por percentil
+    print("  (Usando cortes fijos por percentil)")
+    percentiles = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+    bins = [df_d10["MONTO"].quantile(p/100) for p in percentiles]
+    bins = sorted(set(bins))  # eliminar duplicados
+    df_d10["DECIL"] = pd.cut(df_d10["MONTO"], bins=bins, include_lowest=True)
+    tabla_d10 = df_d10.groupby("DECIL").agg(
+        Trx=("MONTO","count"), Fraudes=("ES_FRAUDE","sum"),
+        Monto_total=("MONTO","sum"), Ticket=("MONTO","mean")
+    )
+    print(tabla_d10.to_string())
+
+print(tabla_d10.to_string())
