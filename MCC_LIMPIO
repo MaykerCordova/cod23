@@ -1,0 +1,11 @@
+#"MCC Limpio" = Table.TransformColumns(
+    #"PasoAnterior",
+    {{
+        "MCC",
+        each Text.PadStart(
+            Text.BeforeDelimiter(Text.From(_), "."),
+            4, "0"
+        ),
+        type text
+    }}
+)
