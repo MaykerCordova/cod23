@@ -15,6 +15,8 @@ Bloques:
 
 import pandas as pd
 import numpy as np
+import sys
+import os
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -24,14 +26,77 @@ from config import COLS, PARQUET_INPUT, PARQUET_OUTPUT
 C = COLS   # alias corto
 
 
+def leer_archivo(ruta):
+    """Lee parquet, CSV o Excel según la extensión real del archivo."""
+    if not os.path.exists(ruta):
+        print(f"\n❌ ERROR: No se encontró el archivo: {ruta}")
+        print("   Verifica que PARQUET_INPUT en config.py sea la ruta correcta.")
+        print("   También puedes pasar la ruta como argumento:")
+        print("   python feature_engineering.py C:\\ruta\\a\\tu_archivo.csv\n")
+        sys.exit(1)
+
+    ext = os.path.splitext(ruta)[1].lower()
+
+    # Intentar parquet primero (independiente de extensión)
+    if ext in (".parquet", ".pq", "") :
+        try:
+            df = pd.read_parquet(ruta)
+            print(f"  Formato detectado  : Parquet ✅")
+            return df
+        except Exception:
+            pass  # no era parquet real, seguir intentando
+
+    if ext in (".csv", ".txt"):
+        df = pd.read_csv(ruta, encoding="utf-8", low_memory=False,
+                         on_bad_lines="warn")
+        print(f"  Formato detectado  : CSV ✅")
+        return df
+
+    if ext in (".xlsx", ".xls", ".xlsm"):
+        df = pd.read_excel(ruta)
+        print(f"  Formato detectado  : Excel ✅")
+        return df
+
+    # Último recurso: intentar CSV aunque la extensión diga parquet
+    try:
+        df = pd.read_csv(ruta, encoding="utf-8", low_memory=False,
+                         on_bad_lines="warn")
+        print(f"  Formato detectado  : CSV (extensión era {ext}) ✅")
+        return df
+    except Exception:
+        pass
+
+    print(f"\n❌ ERROR: No se pudo leer '{ruta}'.")
+    print("   Formatos soportados: .parquet, .csv, .txt, .xlsx")
+    print("   Si el archivo viene de una extracción de base de datos,")
+    print("   expórtalo como CSV y actualiza PARQUET_INPUT en config.py.\n")
+    sys.exit(1)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  CARGA
 # ═══════════════════════════════════════════════════════════════════════════════
-print("─" * 65)
-print("Cargando parquet (todo fraude confirmado)...")
-df = pd.read_parquet(PARQUET_INPUT)
+# Acepta ruta como argumento: python feature_engineering.py mi_archivo.csv
+ruta_entrada = sys.argv[1] if len(sys.argv) > 1 else PARQUET_INPUT
 
-# Limpiar espacios en columnas de texto
+print("─" * 65)
+print(f"Cargando: {ruta_entrada}")
+df = leer_archivo(ruta_entrada)
+
+# ── Conversión de tipos ───────────────────────────────────────────────────────
+# Montos → numérico (pueden venir como string con comas o espacios)
+for col_key in ["monto", "monto_dolar", "saldo_disponible"]:
+    col_val = C.get(col_key)
+    if col_val and col_val in df.columns:
+        df[col_val] = (
+            df[col_val].astype(str)
+            .str.strip()
+            .str.replace(",", ".", regex=False)   # coma decimal → punto
+            .str.replace(" ", "", regex=False)    # quitar espacios
+        )
+        df[col_val] = pd.to_numeric(df[col_val], errors="coerce")
+
+# Texto → limpiar y normalizar
 COLS_TEXTO = [
     C["tarjeta"], C["comercio_id"], C["canal"], C["tipo_tarjeta"],
     C["segmento"], C["organizacion"], C["modalidad_fraude"],
@@ -45,32 +110,28 @@ print(f"  Filas              : {len(df):,}")
 print(f"  Tarjetas únicas    : {df[C['tarjeta']].nunique():,}")
 print(f"  Comercios únicos   : {df[C['comercio_id']].nunique():,}")
 print(f"  Monto total (local): {df[C['monto']].sum():,.2f}")
-if C["monto_dolar"] in df.columns:
+if C.get("monto_dolar") and C["monto_dolar"] in df.columns:
     print(f"  Monto total (USD)  : {df[C['monto_dolar']].sum():,.2f}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  BLOQUE A — Parseo de FECHA (YYYYMMDD) + HORA (HH:MM:SS)  →  DATETIME_TRX
-#             y FECHA_CIERRE (YYYYMMDD) → DATETIME_CIERRE
+#  BLOQUE A — Parseo de fechas
+#   DATETIME_TRX  ← columna combinada  "YYYY-MM-DD HH:MM:SS"
+#   DATETIME_CIERRE ← columna solo fecha "YYYY-MM-DD"
 # ═══════════════════════════════════════════════════════════════════════════════
 print("\n[A] Construcción de DATETIMEs...")
 
-def parsear_fecha_hora(df_in, col_fecha, col_hora=None, nombre_salida="DATETIME"):
-    fecha_str = df_in[col_fecha].astype(str).str.zfill(8)
-    if col_hora:
-        hora_str = df_in[col_hora].astype(str).str.strip()
-        dt = pd.to_datetime(fecha_str + " " + hora_str, format="%Y%m%d %H:%M:%S", errors="coerce")
-    else:
-        dt = pd.to_datetime(fecha_str, format="%Y%m%d", errors="coerce")
+def parsear_dt(serie, nombre):
+    dt = pd.to_datetime(serie.astype(str).str.strip(), errors="coerce")
     nulos = dt.isna().sum()
     if nulos > 0:
-        print(f"  ⚠️  {nulos:,} filas con {nombre_salida} no parseado")
+        print(f"  ⚠️  {nulos:,} filas con {nombre} no parseado — revisa el formato")
     else:
-        print(f"  {nombre_salida} OK ✅")
+        print(f"  {nombre} OK ✅")
     return dt
 
-df["DATETIME_TRX"]    = parsear_fecha_hora(df, C["fecha_trx"], C["hora_trx"], "DATETIME_TRX")
-df["DATETIME_CIERRE"] = parsear_fecha_hora(df, C["fecha_cierre"], nombre_salida="DATETIME_CIERRE")
+df["DATETIME_TRX"]    = parsear_dt(df[C["fecha_hora_trx"]], "DATETIME_TRX")
+df["DATETIME_CIERRE"] = parsear_dt(df[C["fecha_cierre"]],   "DATETIME_CIERRE")
 
 df = df.sort_values("DATETIME_TRX").reset_index(drop=True)
 

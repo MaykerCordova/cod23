@@ -11,10 +11,9 @@ COLS = {
     "comercio_id"      : "COMERCIO_ID",       # ID o código del comercio
     "comercio_nom"     : "COMERCIO_NOMBRE",   # nombre del comercio (si no existe, pon igual que comercio_id)
 
-    # ── Fechas (SEPARADAS en el parquet) ─────────────────────────────────────
-    "fecha_trx"        : "FECHA",             # fecha de la transacción  formato YYYYMMDD  ej. 20240115
-    "hora_trx"         : "HORA",              # hora de la transacción   formato HH:MM:SS  ej. 14:30:00
-    "fecha_cierre"     : "FECHA_CIERRE",      # fecha en que se cerró el caso de investigación (mismo formato YYYYMMDD)
+    # ── Fechas ───────────────────────────────────────────────────────────────
+    "fecha_hora_trx"   : "POS1_FECHA_HORA_TRX",  # datetime combinado  formato YYYY-MM-DD HH:MM:SS  ej. 2025-07-02 17:18:49
+    "fecha_cierre"     : "FECHA_CIERRE",          # fecha de cierre del caso  formato YYYY-MM-DD  ej. 2025-08-10
 
     # ── Montos ────────────────────────────────────────────────────────────────
     "monto"            : "IMPORTE",           # monto en moneda local (numérico)
