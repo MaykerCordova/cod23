@@ -22,3 +22,32 @@ fi = ws.max_row + 2
 agregar_interpretacion(ws, fi, len(df_tc.columns),
     f"Comercio con mayor monto de fraude aprobado: '{top1}' ({monto_top1}). "
     "Si concentra >50% del monto total de fraude, es candidato prioritario para regla específica.")
+########
+# ── HOJA 2B: APERTURA DECIL 10 ───────────────────────────────────────────
+    sheet = "2B_Apertura_D10"
+    if isinstance(tabla_d10, pd.DataFrame) and len(tabla_d10) > 0:
+        tabla_d10.to_excel(writer, sheet_name=sheet, startrow=3)
+        ws = writer.sheets[sheet]
+        n_cols_d10 = len(tabla_d10.columns) + 2
+        estilizar_header(ws, 1, n_cols_d10,
+            "MCC 7995 — APERTURA DEL DECIL 10 (transacciones de mayor monto)")
+        estilizar_header(ws, 2, n_cols_d10,
+            f"Rango analizado: montos ≥ S/ {monto_d10_min:,.2f} (percentil 90)",
+            fill=FILL_SUBHEAD)
+        estilizar_encabezados_df(ws, 4)
+        estilizar_datos(ws, 5, ws.max_row)
+
+        # Interpretación automática
+        if "Fraude Trx Aprobado" in tabla_d10.columns:
+            decil_max_f10 = tabla_d10["Fraude Trx Aprobado"].idxmax()
+            decil_max_m10 = tabla_d10["Fraude Monto Aprobado"].idxmax()
+            fi = ws.max_row + 2
+            agregar_interpretacion(ws, fi, n_cols_d10,
+                f"Dentro del D10, el sub-decil con más fraudes aprobados es {decil_max_f10} "
+                f"({tabla_d10.loc[decil_max_f10,'Fraude Trx Aprobado']:,} fraudes) — "
+                f"Rango: {tabla_d10.loc[decil_max_f10,'Rango S/']}")
+            agregar_interpretacion(ws, fi+1, n_cols_d10,
+                f"Mayor monto de fraude aprobado en {decil_max_m10}: "
+                f"S/ {tabla_d10.loc[decil_max_m10,'Fraude Monto Aprobado']:,.2f}. "
+                "Este rango es el candidato principal para un umbral de monto en la regla.")
+        ajustar_columnas(ws)
