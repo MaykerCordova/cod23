@@ -1,0 +1,24 @@
+df_tc = df_top_comercios.copy()
+df_tc["Monto Fraude Total S/"]    = df_tc["Monto Fraude Total S/"].map("S/ {:,.2f}".format)
+df_tc["Monto Fraude Aprobado S/"] = df_tc["Monto Fraude Aprobado S/"].map("S/ {:,.2f}".format)
+df_tc["Monto Total S/"]           = df_tc["Monto Total S/"].map("S/ {:,.2f}".format)
+df_tc["Fraud Rate % (ap)"]        = df_tc["Fraud Rate % (ap)"].map("{:.2f}%".format)
+
+top1 = df_tc.iloc[0]["Comercio"] if len(df_tc) > 0 else "N/A"
+
+
+top1       = df_tc.iloc[0]["Comercio"]              if len(df_tc) > 0 else "N/A"
+monto_top1 = df_tc.iloc[0]["Monto Fraude Aprobado S/"] if len(df_tc) > 0 else "S/ 0"
+fi = ws.max_row + 2
+agregar_interpretacion(ws, fi, len(df_tc.columns),
+    f"Comercio con mayor monto de fraude aprobado: '{top1}' ({monto_top1}). "
+    "Si concentra >50% del monto total de fraude, es candidato prioritario para regla específica.")
+
+
+#########
+top1       = df_tc.iloc[0]["Comercio"]               if len(df_tc) > 0 else "N/A"
+monto_top1 = df_tc.iloc[0]["Monto Fraude Aprobado S/"] if len(df_tc) > 0 else "S/ 0"
+fi = ws.max_row + 2
+agregar_interpretacion(ws, fi, len(df_tc.columns),
+    f"Comercio con mayor monto de fraude aprobado: '{top1}' ({monto_top1}). "
+    "Si concentra >50% del monto total de fraude, es candidato prioritario para regla específica.")

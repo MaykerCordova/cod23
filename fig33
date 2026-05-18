@@ -1,0 +1,17 @@
+fig3 = make_subplots(rows=2, cols=2, subplot_titles=[d[1] for d in dims])
+for i,(col,titulo) in enumerate(dims):
+    r,c = divmod(i,2)
+    sub = resumen_por(df, col, top_n=8).reset_index()
+    fig3.add_trace(go.Bar(
+        x=sub[col], y=sub["Fraude_Aprobado"],
+        name="Fraude Aprobado",
+        text=sub["Fraude_Aprobado"].apply(lambda v: f"{v:,}"),
+        textposition="outside", marker_color=C_FRAUDE, showlegend=False,
+    ), row=r+1, col=c+1)
+    fig3.add_trace(go.Bar(
+        x=sub[col], y=sub["Fraude_Total"],
+        name="Fraude Total",
+        text=sub["Fraude_Total"].apply(lambda v: f"{v:,}"),
+        textposition="outside", marker_color="#8B0000",
+        opacity=0.6, showlegend=False,
+    ), row=r+1, col=c+1)
