@@ -1,0 +1,7 @@
+df_tc = df_top_comercios.copy()
+df_tc["Monto Fraude Total S/"]    = df_tc["Monto Fraude Total S/"].map("S/ {:,.2f}".format)
+df_tc["Monto Fraude Aprobado S/"] = df_tc["Monto Fraude Aprobado S/"].map("S/ {:,.2f}".format)
+df_tc["Monto Total S/"]           = df_tc["Monto Total S/"].map("S/ {:,.2f}".format)
+df_tc["Fraud Rate % (ap)"]        = df_tc["Fraud Rate % (ap)"].map("{:.2f}%".format)
+
+top1 = df_tc.iloc[0]["Comercio"] if len(df_tc) > 0 else "N/A"
