@@ -1,15 +1,16 @@
 """
 Feature Engineering — Comercios No Seguros (sin 3DS/TDS)
-Dataset: fraudes confirmados (calificación F) extraídos de la 8850.
+Dataset: fraudes confirmados ya filtrados (todo el parquet es fraude F).
 
 Bloques:
-  A  Parseo de fecha + hora  → DATETIME
+  A  Parseo de fechas  → DATETIME_TRX, DATETIME_CIERRE
   B  Variables temporales    → hora, día, franja, quincena
-  C  Velocidad por tarjeta   → conteo/monto de fraudes de esa tarjeta
-  D  Perfil del comercio     → cuántos fraudes concentra cada comercio
-  E  Señales de monto        → monto redondo, desviación, rango
-  F  Combinación de riesgo   → flags compuestos para el dashboard
-  G  Guardar parquet enriquecido
+  C  Días de investigación   → DIAS_PARA_CIERRE
+  D  Velocidad por tarjeta   → conteo/monto de fraudes de esa tarjeta
+  E  Perfil del comercio     → concentración de fraude por comercio/MCC
+  F  Señales de monto        → monto redondo, ratio vs saldo, rango
+  G  Flags compuestos        → score de riesgo, perfil para Power BI
+  H  Guardar parquet enriquecido
 """
 
 import pandas as pd
@@ -20,116 +21,147 @@ warnings.filterwarnings("ignore")
 
 from config import COLS, PARQUET_INPUT, PARQUET_OUTPUT
 
-# ── Alias cortos para no repetir COLS["..."] en todo el script ────────────────
-C = COLS
+C = COLS   # alias corto
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  CARGA
 # ═══════════════════════════════════════════════════════════════════════════════
-print("─" * 60)
-print("Cargando parquet...")
+print("─" * 65)
+print("Cargando parquet (todo fraude confirmado)...")
 df = pd.read_parquet(PARQUET_INPUT)
 
 # Limpiar espacios en columnas de texto
-for col in [C["tarjeta"], C["comercio_id"], C["canal"], C["tipo_tarjeta"], C["segmento"]]:
+COLS_TEXTO = [
+    C["tarjeta"], C["comercio_id"], C["canal"], C["tipo_tarjeta"],
+    C["segmento"], C["organizacion"], C["modalidad_fraude"],
+    C["nivel_tarjeta"], C["mcc"],
+]
+for col in COLS_TEXTO:
     if col in df.columns:
         df[col] = df[col].astype(str).str.strip().str.upper()
 
-# Filtro de seguridad: solo fraudes confirmados
-if C["calificacion"] in df.columns:
-    df = df[df[C["calificacion"]].astype(str).str.upper() == "F"].copy()
-
-print(f"  Filas (fraudes F)  : {len(df):,}")
+print(f"  Filas              : {len(df):,}")
 print(f"  Tarjetas únicas    : {df[C['tarjeta']].nunique():,}")
 print(f"  Comercios únicos   : {df[C['comercio_id']].nunique():,}")
-print(f"  Monto total        : {df[C['monto']].sum():,.2f}")
+print(f"  Monto total (local): {df[C['monto']].sum():,.2f}")
+if C["monto_dolar"] in df.columns:
+    print(f"  Monto total (USD)  : {df[C['monto_dolar']].sum():,.2f}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  BLOQUE A — Parseo de FECHA (YYYYMMDD) + HORA (HH:MM:SS)  →  DATETIME
+#  BLOQUE A — Parseo de FECHA (YYYYMMDD) + HORA (HH:MM:SS)  →  DATETIME_TRX
+#             y FECHA_CIERRE (YYYYMMDD) → DATETIME_CIERRE
 # ═══════════════════════════════════════════════════════════════════════════════
-print("\n[A] Construcción de DATETIME...")
+print("\n[A] Construcción de DATETIMEs...")
 
-fecha_str = df[C["fecha"]].astype(str).str.zfill(8)   # garantiza 8 dígitos
-hora_str  = df[C["hora"]].astype(str).str.strip()
+def parsear_fecha_hora(df_in, col_fecha, col_hora=None, nombre_salida="DATETIME"):
+    fecha_str = df_in[col_fecha].astype(str).str.zfill(8)
+    if col_hora:
+        hora_str = df_in[col_hora].astype(str).str.strip()
+        dt = pd.to_datetime(fecha_str + " " + hora_str, format="%Y%m%d %H:%M:%S", errors="coerce")
+    else:
+        dt = pd.to_datetime(fecha_str, format="%Y%m%d", errors="coerce")
+    nulos = dt.isna().sum()
+    if nulos > 0:
+        print(f"  ⚠️  {nulos:,} filas con {nombre_salida} no parseado")
+    else:
+        print(f"  {nombre_salida} OK ✅")
+    return dt
 
-df["DATETIME"] = pd.to_datetime(
-    fecha_str + " " + hora_str,
-    format="%Y%m%d %H:%M:%S",
-    errors="coerce"
-)
+df["DATETIME_TRX"]    = parsear_fecha_hora(df, C["fecha_trx"], C["hora_trx"], "DATETIME_TRX")
+df["DATETIME_CIERRE"] = parsear_fecha_hora(df, C["fecha_cierre"], nombre_salida="DATETIME_CIERRE")
 
-nulos_dt = df["DATETIME"].isna().sum()
-if nulos_dt > 0:
-    print(f"  ⚠️  {nulos_dt:,} filas con DATETIME no parseado — revisa el formato de fecha/hora")
-else:
-    print("  DATETIME OK ✅")
-
-df = df.sort_values(["DATETIME"]).reset_index(drop=True)
+df = df.sort_values("DATETIME_TRX").reset_index(drop=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  BLOQUE B — Variables temporales
+#  BLOQUE B — Variables temporales de la TRANSACCIÓN
 # ═══════════════════════════════════════════════════════════════════════════════
 print("\n[B] Variables temporales...")
 
-df["HORA_DIA"]     = df["DATETIME"].dt.hour
-df["DIA_SEMANA"]   = df["DATETIME"].dt.dayofweek          # 0=Lunes … 6=Domingo
-df["DIA_SEMANA_NOM"] = df["DATETIME"].dt.day_name(locale=None).str[:3].str.upper()
-df["MES"]          = df["DATETIME"].dt.month
-df["MES_NOM"]      = df["DATETIME"].dt.strftime("%b").str.upper()
-df["FECHA_DIA"]    = df["DATETIME"].dt.date               # para agrupaciones diarias
-df["SEMANA_ISO"]   = df["DATETIME"].dt.isocalendar().week.astype(int)
-
-# Flags de día
-df["ES_FIN_SEMANA"] = (df["DIA_SEMANA"] >= 5).astype(int)  # Sab=5, Dom=6
+df["HORA_DIA"]       = df["DATETIME_TRX"].dt.hour
+df["DIA_SEMANA"]     = df["DATETIME_TRX"].dt.dayofweek         # 0=Lun … 6=Dom
+df["DIA_SEMANA_NOM"] = df["DATETIME_TRX"].dt.strftime("%a").str.upper()
+df["MES"]            = df["DATETIME_TRX"].dt.month
+df["MES_NOM"]        = df["DATETIME_TRX"].dt.strftime("%b").str.upper()
+df["ANIO"]           = df["DATETIME_TRX"].dt.year
+df["FECHA_DIA"]      = df["DATETIME_TRX"].dt.date
+df["SEMANA_ISO"]     = df["DATETIME_TRX"].dt.isocalendar().week.astype(int)
+df["ES_FIN_SEMANA"]  = (df["DIA_SEMANA"] >= 5).astype(int)
+df["QUINCENA"]       = np.where(df["DATETIME_TRX"].dt.day <= 15, "Q1", "Q2")
 
 # Franja horaria
+_FRANJAS = [(0, 6, "MADRUGADA"), (6, 12, "MAÑANA"), (12, 19, "TARDE"), (19, 24, "NOCHE")]
 def franja(h):
-    if   0  <= h <  6: return "MADRUGADA"   # 00-05
-    elif 6  <= h < 12: return "MAÑANA"      # 06-11
-    elif 12 <= h < 19: return "TARDE"       # 12-18
-    else:              return "NOCHE"       # 19-23
+    for ini, fin, nom in _FRANJAS:
+        if ini <= h < fin:
+            return nom
+    return "NOCHE"
 
 df["FRANJA_HORARIA"] = df["HORA_DIA"].map(franja)
 df["ES_MADRUGADA"]   = (df["FRANJA_HORARIA"] == "MADRUGADA").astype(int)
-df["ES_HORARIO_LAB"] = (
-    (df["DIA_SEMANA"] < 5) & df["HORA_DIA"].between(8, 17)
-).astype(int)
+df["ES_HORARIO_LAB"] = ((df["DIA_SEMANA"] < 5) & df["HORA_DIA"].between(8, 17)).astype(int)
 
-# Quincena del mes
-df["QUINCENA"] = np.where(df["DATETIME"].dt.day <= 15, "Q1", "Q2")
-
-print("  Variables temporales creadas ✅")
-print(f"    Distribución por franja:\n{df['FRANJA_HORARIA'].value_counts().to_string()}")
+print("  Variables temporales OK ✅")
+print(f"  Distribución FRANJA_HORARIA:\n{df['FRANJA_HORARIA'].value_counts().to_string()}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  BLOQUE C — Velocidad / comportamiento de la TARJETA en el dataset de fraudes
+#  BLOQUE C — Días de investigación  (DATETIME_CIERRE - DATETIME_TRX)
 # ═══════════════════════════════════════════════════════════════════════════════
-print("\n[C] Velocidad por tarjeta...")
+print("\n[C] Días de investigación...")
 
-# ── C1: Totales por tarjeta en todo el dataset ────────────────────────────────
-totales_tarjeta = (
+df["DIAS_PARA_CIERRE"] = (df["DATETIME_CIERRE"] - df["DATETIME_TRX"]).dt.days
+
+validos = df["DIAS_PARA_CIERRE"].notna() & (df["DIAS_PARA_CIERRE"] >= 0)
+print(f"  Registros con cierre válido : {validos.sum():,}")
+print(f"  Días promedio para cierre   : {df.loc[validos,'DIAS_PARA_CIERRE'].mean():.1f}")
+print(f"  Días máx para cierre        : {df.loc[validos,'DIAS_PARA_CIERRE'].max():.0f}")
+
+# Rango de tiempo de investigación
+def rango_cierre(d):
+    if   pd.isna(d) or d < 0: return "SIN_CIERRE"
+    elif d <= 1:               return "1_DIA"
+    elif d <= 7:               return "1_SEMANA"
+    elif d <= 30:              return "1_MES"
+    else:                      return "MAS_1_MES"
+
+df["RANGO_DIAS_CIERRE"] = df["DIAS_PARA_CIERRE"].map(rango_cierre)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  BLOQUE D — Velocidad / comportamiento de la TARJETA
+# ═══════════════════════════════════════════════════════════════════════════════
+print("\n[D] Comportamiento por tarjeta...")
+
+# Totales por tarjeta en todo el dataset
+totales_trj = (
     df.groupby(C["tarjeta"])
     .agg(
-        TOTAL_FRAUDES_TARJETA    = (C["monto"], "count"),
-        MONTO_TOTAL_FRAUDE_TRJ   = (C["monto"], "sum"),
-        COMERCIOS_DISTINTOS_TRJ  = (C["comercio_id"], "nunique"),
-        CANALES_DISTINTOS_TRJ    = (C["canal"], "nunique"),
+        TOTAL_FRAUDES_TARJETA   = (C["monto"], "count"),
+        MONTO_TOTAL_FRAUDE_TRJ  = (C["monto"], "sum"),
+        MONTO_USD_FRAUDE_TRJ    = (C["monto_dolar"], "sum") if C["monto_dolar"] in df.columns else (C["monto"], "count"),
+        COMERCIOS_DISTINTOS_TRJ = (C["comercio_id"], "nunique"),
+        MCC_DISTINTOS_TRJ       = (C["mcc"], "nunique"),
+        CANALES_DISTINTOS_TRJ   = (C["canal"], "nunique"),
+        DIAS_ACTIVA_TRJ         = ("FECHA_DIA", "nunique"),
     )
     .reset_index()
 )
-df = df.merge(totales_tarjeta, on=C["tarjeta"], how="left")
+# Si no tiene monto_dolar, renombrar columna duplicada
+if C["monto_dolar"] not in df.columns:
+    totales_trj = totales_trj.rename(columns={"MONTO_USD_FRAUDE_TRJ": "_DROP"}).drop(columns=["_DROP"])
 
-# ── C2: Fraudes de la tarjeta en el MISMO DÍA ────────────────────────────────
+df = df.merge(totales_trj, on=C["tarjeta"], how="left")
+
+# Fraudes de la tarjeta en el MISMO DÍA
 fraudes_dia_trj = (
     df.groupby([C["tarjeta"], "FECHA_DIA"])
     .agg(
-        FRAUDES_TRJ_DIA         = (C["monto"], "count"),
-        MONTO_FRAUDE_TRJ_DIA    = (C["monto"], "sum"),
-        COMERCIOS_DISTINTOS_DIA = (C["comercio_id"], "nunique"),
+        FRAUDES_TRJ_DIA          = (C["monto"], "count"),
+        MONTO_FRAUDE_TRJ_DIA     = (C["monto"], "sum"),
+        COMERCIOS_DISTINTOS_DIA  = (C["comercio_id"], "nunique"),
     )
     .reset_index()
 )
@@ -138,92 +170,136 @@ df = df.merge(fraudes_dia_trj, on=[C["tarjeta"], "FECHA_DIA"], how="left")
 # Flags de velocidad
 df["FLAG_TARJETA_REINCIDENTE"] = (df["TOTAL_FRAUDES_TARJETA"] > 1).astype(int)
 df["FLAG_MULTI_COMERCIO_DIA"]  = (df["COMERCIOS_DISTINTOS_DIA"] > 1).astype(int)
-df["FLAG_RAFAGA_DIA"]          = (df["FRAUDES_TRJ_DIA"] >= 3).astype(int)  # 3+ fraudes en un día
+df["FLAG_RAFAGA_DIA"]          = (df["FRAUDES_TRJ_DIA"] >= 3).astype(int)
 
-print("  Variables por tarjeta creadas ✅")
-print(f"    Tarjetas reincidentes    : {df.loc[df['FLAG_TARJETA_REINCIDENTE']==1, C['tarjeta']].nunique():,}")
-print(f"    Ráfagas (≥3 fraudes/día) : {df['FLAG_RAFAGA_DIA'].sum():,} transacciones")
+# Ratio monto del fraude vs saldo disponible
+if C["saldo_disponible"] in df.columns:
+    df["RATIO_MONTO_VS_SALDO"] = (
+        df[C["monto"]] / df[C["saldo_disponible"]].replace(0, np.nan)
+    ).round(4)
+    df["FLAG_SALDO_AGOTADO"] = (df["RATIO_MONTO_VS_SALDO"] >= 0.9).astype(int)
+    print(f"  RATIO_MONTO_VS_SALDO OK ✅  |  Fraudes que agotan saldo (≥90%): {df['FLAG_SALDO_AGOTADO'].sum():,}")
+
+print(f"  Tarjetas reincidentes     : {df.loc[df['FLAG_TARJETA_REINCIDENTE']==1, C['tarjeta']].nunique():,}")
+print(f"  Ráfagas (≥3 fraudes/día)  : {df['FLAG_RAFAGA_DIA'].sum():,} transacciones")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  BLOQUE D — Perfil del COMERCIO
+#  BLOQUE E — Perfil del COMERCIO y del MCC
 # ═══════════════════════════════════════════════════════════════════════════════
-print("\n[D] Perfil del comercio...")
+print("\n[E] Perfil de comercio y MCC...")
 
-totales_comercio = (
+# Por comercio
+totales_com = (
     df.groupby(C["comercio_id"])
     .agg(
-        TOTAL_FRAUDES_COMERCIO   = (C["monto"], "count"),
-        MONTO_TOTAL_FRAUDE_COM   = (C["monto"], "sum"),
-        MONTO_PROM_FRAUDE_COM    = (C["monto"], "mean"),
-        TARJETAS_DISTINTAS_COM   = (C["tarjeta"], "nunique"),
-        CANALES_DISTINTOS_COM    = (C["canal"], "nunique"),
+        TOTAL_FRAUDES_COMERCIO  = (C["monto"], "count"),
+        MONTO_TOTAL_FRAUDE_COM  = (C["monto"], "sum"),
+        MONTO_PROM_FRAUDE_COM   = (C["monto"], "mean"),
+        TARJETAS_DISTINTAS_COM  = (C["tarjeta"], "nunique"),
+        CANALES_DISTINTOS_COM   = (C["canal"], "nunique"),
+        DIAS_CON_FRAUDE_COM     = ("FECHA_DIA", "nunique"),
     )
     .reset_index()
 )
-df = df.merge(totales_comercio, on=C["comercio_id"], how="left")
+df = df.merge(totales_com, on=C["comercio_id"], how="left")
 
 # Fraudes por comercio por día
-fraudes_dia_com = (
+fraudes_com_dia = (
     df.groupby([C["comercio_id"], "FECHA_DIA"])
     .agg(FRAUDES_COM_DIA = (C["monto"], "count"))
     .reset_index()
 )
-df = df.merge(fraudes_dia_com, on=[C["comercio_id"], "FECHA_DIA"], how="left")
+df = df.merge(fraudes_com_dia, on=[C["comercio_id"], "FECHA_DIA"], how="left")
 
 # Ranking de comercios más golpeados
 rank_com = (
-    totales_comercio
+    totales_com[[C["comercio_id"], "TOTAL_FRAUDES_COMERCIO"]]
     .sort_values("TOTAL_FRAUDES_COMERCIO", ascending=False)
     .reset_index(drop=True)
 )
 rank_com["RANKING_COMERCIO"] = rank_com.index + 1
 df = df.merge(rank_com[[C["comercio_id"], "RANKING_COMERCIO"]], on=C["comercio_id"], how="left")
 
-print("  Variables por comercio creadas ✅")
-print(f"    Top 5 comercios más golpeados:")
-print(rank_com[[C["comercio_id"], "TOTAL_FRAUDES_COMERCIO", "MONTO_TOTAL_FRAUDE_COM"]].head(5).to_string(index=False))
+# Por MCC
+totales_mcc = (
+    df.groupby(C["mcc"])
+    .agg(
+        TOTAL_FRAUDES_MCC  = (C["monto"], "count"),
+        MONTO_TOTAL_MCC    = (C["monto"], "sum"),
+        COMERCIOS_EN_MCC   = (C["comercio_id"], "nunique"),
+        TARJETAS_EN_MCC    = (C["tarjeta"], "nunique"),
+    )
+    .reset_index()
+)
+df = df.merge(totales_mcc, on=C["mcc"], how="left")
+
+rank_mcc = (
+    totales_mcc[[C["mcc"], "TOTAL_FRAUDES_MCC"]]
+    .sort_values("TOTAL_FRAUDES_MCC", ascending=False)
+    .reset_index(drop=True)
+)
+rank_mcc["RANKING_MCC"] = rank_mcc.index + 1
+df = df.merge(rank_mcc[[C["mcc"], "RANKING_MCC"]], on=C["mcc"], how="left")
+
+print("  Perfil comercio y MCC OK ✅")
+print(f"  Top 5 comercios:\n{rank_com.head(5).to_string(index=False)}")
+print(f"  Top 5 MCC:\n{rank_mcc.head(5).to_string(index=False)}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  BLOQUE E — Señales de MONTO
+#  BLOQUE F — Señales de MONTO
 # ═══════════════════════════════════════════════════════════════════════════════
-print("\n[E] Señales de monto...")
+print("\n[F] Señales de monto...")
 
-# Monto redondo: sin decimales o terminado en .00
+# Monto redondo
 df["FLAG_MONTO_REDONDO"] = (df[C["monto"]] % 1 == 0).astype(int)
 
-# Desviación del monto respecto al promedio del comercio
+# Desviación vs promedio del comercio
 df["DESVIO_MONTO_VS_COM"] = df[C["monto"]] - df["MONTO_PROM_FRAUDE_COM"]
 df["RATIO_MONTO_VS_COM"]  = (df[C["monto"]] / df["MONTO_PROM_FRAUDE_COM"].replace(0, np.nan)).round(2)
 
-# Rango de monto (cuartiles del dataset)
+# Rango de monto
 q25, q50, q75 = df[C["monto"]].quantile([0.25, 0.50, 0.75])
-
 def rango_monto(m):
     if   m <= q25: return "BAJO"
     elif m <= q50: return "MEDIO_BAJO"
     elif m <= q75: return "MEDIO_ALTO"
     else:          return "ALTO"
-
 df["RANGO_MONTO"] = df[C["monto"]].map(rango_monto)
 
-print(f"  Cuartiles de monto: Q25={q25:.2f} | Q50={q50:.2f} | Q75={q75:.2f}")
-print(f"  Montos redondos    : {df['FLAG_MONTO_REDONDO'].sum():,} ({df['FLAG_MONTO_REDONDO'].mean()*100:.1f}%)")
+# Tipo de cambio implícito (si hay monto local y dólar)
+if C["monto_dolar"] in df.columns:
+    df["TIPO_CAMBIO_IMPLICITO"] = (
+        df[C["monto"]] / df[C["monto_dolar"]].replace(0, np.nan)
+    ).round(4)
+
+print(f"  Cuartiles monto: Q25={q25:.2f} | Q50={q50:.2f} | Q75={q75:.2f}")
+print(f"  Montos redondos : {df['FLAG_MONTO_REDONDO'].sum():,} ({df['FLAG_MONTO_REDONDO'].mean()*100:.1f}%)")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  BLOQUE F — Flags compuestos de RIESGO (para slicers en Power BI)
+#  BLOQUE G — Flags compuestos de RIESGO (slicers Power BI)
 # ═══════════════════════════════════════════════════════════════════════════════
-print("\n[F] Flags compuestos de riesgo...")
+print("\n[G] Flags compuestos de riesgo...")
 
-# Perfil de riesgo de la tarjeta (cuántas señales activa)
+# CVV estático
+if C["cvv_dinamico"] and C["cvv_dinamico"] in df.columns:
+    df["FLAG_CVV_ESTATICO"] = (
+        df[C["cvv_dinamico"]].astype(str).str.upper().isin(["N", "NO", "0", "FALSE"])
+    ).astype(int)
+    cvv_flag = df["FLAG_CVV_ESTATICO"]
+else:
+    cvv_flag = pd.Series(0, index=df.index)
+
+# Score de riesgo compuesto
 df["SCORE_RIESGO_TRJ"] = (
     df["FLAG_TARJETA_REINCIDENTE"] +
     df["FLAG_MULTI_COMERCIO_DIA"]  +
     df["FLAG_RAFAGA_DIA"]          +
     df["FLAG_MONTO_REDONDO"]       +
-    df["ES_MADRUGADA"]
+    df["ES_MADRUGADA"]             +
+    cvv_flag
 )
 
 df["PERFIL_RIESGO"] = pd.cut(
@@ -232,58 +308,57 @@ df["PERFIL_RIESGO"] = pd.cut(
     labels=["BAJO", "MEDIO", "ALTO", "MUY_ALTO"]
 )
 
-# Flag madrugada + fin de semana (patrón frecuente en fraude CNP)
 df["FLAG_HORARIO_RIESGO"] = (
     (df["ES_MADRUGADA"] == 1) | (df["ES_FIN_SEMANA"] == 1)
 ).astype(int)
 
-# CVV dinámico vs estático (si la columna existe)
-if C["cvv_dinamico"] and C["cvv_dinamico"] in df.columns:
-    df["FLAG_CVV_ESTATICO"] = (
-        df[C["cvv_dinamico"]].astype(str).str.upper().isin(["N", "NO", "0", "FALSE"])
-    ).astype(int)
-    print(f"  FLAG_CVV_ESTATICO  : {df['FLAG_CVV_ESTATICO'].sum():,} txns con CVV estático")
-
-print(f"  Distribución PERFIL_RIESGO:\n{df['PERFIL_RIESGO'].value_counts().to_string()}")
+print(f"  PERFIL_RIESGO:\n{df['PERFIL_RIESGO'].value_counts().to_string()}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  RESUMEN DE VARIABLES CONSTRUIDAS
 # ═══════════════════════════════════════════════════════════════════════════════
-vars_nuevas = [
-    # Bloque A/B — temporales
-    "DATETIME", "HORA_DIA", "DIA_SEMANA", "DIA_SEMANA_NOM", "MES", "MES_NOM",
+VARS_NUEVAS = [
+    # A/B — temporales
+    "DATETIME_TRX", "DATETIME_CIERRE",
+    "HORA_DIA", "DIA_SEMANA", "DIA_SEMANA_NOM", "MES", "MES_NOM", "ANIO",
     "FECHA_DIA", "SEMANA_ISO", "ES_FIN_SEMANA", "FRANJA_HORARIA",
     "ES_MADRUGADA", "ES_HORARIO_LAB", "QUINCENA",
-    # Bloque C — tarjeta
+    # C — investigación
+    "DIAS_PARA_CIERRE", "RANGO_DIAS_CIERRE",
+    # D — tarjeta
     "TOTAL_FRAUDES_TARJETA", "MONTO_TOTAL_FRAUDE_TRJ", "COMERCIOS_DISTINTOS_TRJ",
-    "CANALES_DISTINTOS_TRJ", "FRAUDES_TRJ_DIA", "MONTO_FRAUDE_TRJ_DIA",
-    "COMERCIOS_DISTINTOS_DIA",
+    "MCC_DISTINTOS_TRJ", "CANALES_DISTINTOS_TRJ", "DIAS_ACTIVA_TRJ",
+    "FRAUDES_TRJ_DIA", "MONTO_FRAUDE_TRJ_DIA", "COMERCIOS_DISTINTOS_DIA",
     "FLAG_TARJETA_REINCIDENTE", "FLAG_MULTI_COMERCIO_DIA", "FLAG_RAFAGA_DIA",
-    # Bloque D — comercio
+    "RATIO_MONTO_VS_SALDO", "FLAG_SALDO_AGOTADO",
+    # E — comercio / MCC
     "TOTAL_FRAUDES_COMERCIO", "MONTO_TOTAL_FRAUDE_COM", "MONTO_PROM_FRAUDE_COM",
-    "TARJETAS_DISTINTAS_COM", "CANALES_DISTINTOS_COM", "FRAUDES_COM_DIA",
-    "RANKING_COMERCIO",
-    # Bloque E — monto
-    "FLAG_MONTO_REDONDO", "DESVIO_MONTO_VS_COM", "RATIO_MONTO_VS_COM", "RANGO_MONTO",
-    # Bloque F — riesgo compuesto
-    "SCORE_RIESGO_TRJ", "PERFIL_RIESGO", "FLAG_HORARIO_RIESGO",
+    "TARJETAS_DISTINTAS_COM", "CANALES_DISTINTOS_COM", "DIAS_CON_FRAUDE_COM",
+    "FRAUDES_COM_DIA", "RANKING_COMERCIO",
+    "TOTAL_FRAUDES_MCC", "MONTO_TOTAL_MCC", "COMERCIOS_EN_MCC",
+    "TARJETAS_EN_MCC", "RANKING_MCC",
+    # F — monto
+    "FLAG_MONTO_REDONDO", "DESVIO_MONTO_VS_COM", "RATIO_MONTO_VS_COM",
+    "RANGO_MONTO", "TIPO_CAMBIO_IMPLICITO",
+    # G — riesgo compuesto
+    "FLAG_CVV_ESTATICO", "SCORE_RIESGO_TRJ", "PERFIL_RIESGO", "FLAG_HORARIO_RIESGO",
 ]
 
-print("\n─" * 30)
+print("\n" + "─" * 65)
 print("VARIABLES NUEVAS AGREGADAS:")
-for v in vars_nuevas:
-    existe = "✅" if v in df.columns else "❌"
-    print(f"  {existe} {v}")
+for v in VARS_NUEVAS:
+    existe = "✅" if v in df.columns else "—— (columna origen no disponible)"
+    print(f"  {existe}  {v}")
 
 print(f"\nColumnas totales en el dataset enriquecido: {df.shape[1]}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  BLOQUE G — Guardar parquet enriquecido
+#  BLOQUE H — Guardar parquet enriquecido
 # ═══════════════════════════════════════════════════════════════════════════════
-print(f"\n[G] Guardando en: {PARQUET_OUTPUT}")
+print(f"\n[H] Guardando en: {PARQUET_OUTPUT}")
 df.to_parquet(PARQUET_OUTPUT, index=False)
 print(f"  ✅ Listo — {len(df):,} filas × {df.shape[1]} columnas")
 print(f"  Archivo: {PARQUET_OUTPUT}")
-print("─" * 60)
+print("─" * 65)
