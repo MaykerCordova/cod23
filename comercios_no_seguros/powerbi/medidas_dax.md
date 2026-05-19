@@ -498,11 +498,199 @@ DIVIDE(
 ```
 
 ```dax
-Monto Promedio por Nivel =
+Monto Promedio por Tarjeta =
 DIVIDE(
     [Monto Fraude],
     [Tarjetas Únicas]
 )
+-- Formato: #,##0.00
+-- Cuánto se defraudó en promedio por tarjeta afectada
+```
+
+```dax
+-- Tarjetas que aparecen más de una vez en el dataset
+-- (tuvieron fraude en más de un evento/día)
+Tarjetas Reincidentes =
+CALCULATE(
+    [Tarjetas Únicas],
+    'fraudes_comercios_no_seguros_features'[FLAG_TARJETA_REINCIDENTE] = 1
+)
+```
+
+```dax
+-- Tarjetas que tuvieron fraude en 2+ comercios distintos el mismo día
+Tarjetas Multi Comercio =
+CALCULATE(
+    [Tarjetas Únicas],
+    'fraudes_comercios_no_seguros_features'[FLAG_MULTI_COMERCIO_DIA] = 1
+)
+```
+
+```dax
+-- Promedio de comercios distintos donde cada tarjeta tuvo fraude
+Comercios Prom por Tarjeta =
+AVERAGEX(
+    VALUES('fraudes_comercios_no_seguros_features'[TARJETA]),
+    CALCULATE(
+        DISTINCTCOUNT('fraudes_comercios_no_seguros_features'[COMERCIO_ID])
+    )
+)
+-- Formato: 0.00
+-- Interpretación: 2.5 → cada tarjeta afectada tuvo fraude
+--   en promedio en 2.5 comercios distintos
+```
+
+```dax
+-- Fraudes promedio por tarjeta (qué tan recurrente es el fraude)
+Fraudes Prom por Tarjeta =
+DIVIDE(
+    [# Fraudes],
+    [Tarjetas Únicas]
+)
+-- Formato: 0.0
+```
+
+```dax
+-- % de fraudes de tarjetas de crédito sobre el total
+% Crédito =
+DIVIDE(
+    CALCULATE(
+        COUNTROWS('fraudes_comercios_no_seguros_features'),
+        'fraudes_comercios_no_seguros_features'[TIPO_TARJETA] = "CREDITO"
+    ),
+    [# Fraudes]
+)
+-- Formato: 0.0%
+```
+
+```dax
+-- % de fraudes de tarjetas de débito sobre el total
+% Débito =
+DIVIDE(
+    CALCULATE(
+        COUNTROWS('fraudes_comercios_no_seguros_features'),
+        'fraudes_comercios_no_seguros_features'[TIPO_TARJETA] = "DEBITO"
+    ),
+    [# Fraudes]
+)
+-- Formato: 0.0%
+```
+
+```dax
+-- Monto promedio de fraude por tipo de tarjeta
+-- Usar en tooltip del donut Crédito vs Débito
+Ticket Promedio por Tipo =
+DIVIDE(
+    [Monto Fraude],
+    [# Fraudes]
+)
+-- Formato: #,##0.00
+```
+
+```dax
+-- Distribución de PERFIL_RIESGO para gráfico de barras
+-- (la columna ya existe, solo necesitas la medida de conteo)
+-- Visual: Barras apiladas o agrupadas
+-- Eje X: PERFIL_RIESGO  (ordenar: BAJO → MEDIO → ALTO → MUY_ALTO)
+-- Valor: [# Fraudes] y [Monto Fraude]
+-- Columna calculada para ordenar PERFIL_RIESGO:
+Orden Perfil =
+-- Modelado → Nueva columna (no medida)
+SWITCH('fraudes_comercios_no_seguros_features'[PERFIL_RIESGO],
+    "BAJO",     1,
+    "MEDIO",    2,
+    "ALTO",     3,
+    "MUY_ALTO", 4,
+    5
+)
+-- Luego: clic en PERFIL_RIESGO → Ordenar por columna → Orden Perfil
+```
+
+```dax
+-- Score promedio de riesgo de tarjetas en el contexto seleccionado
+Score Riesgo Promedio Tarjetas =
+AVERAGEX(
+    VALUES('fraudes_comercios_no_seguros_features'[TARJETA]),
+    CALCULATE(
+        AVERAGE('fraudes_comercios_no_seguros_features'[SCORE_RIESGO_TRJ])
+    )
+)
+-- Formato: 0.00
+-- Escala de 0 a 6 (suma de flags de riesgo)
+```
+
+```dax
+-- % de tarjetas con perfil MUY_ALTO sobre total de tarjetas
+% Tarjetas MUY ALTO Riesgo =
+DIVIDE(
+    CALCULATE(
+        [Tarjetas Únicas],
+        'fraudes_comercios_no_seguros_features'[PERFIL_RIESGO] = "MUY_ALTO"
+    ),
+    [Tarjetas Únicas]
+)
+-- Formato: 0.0%
+```
+
+```dax
+-- Monto defraudado por tarjetas MUY ALTO riesgo
+Monto Tarjetas MUY ALTO =
+CALCULATE(
+    [Monto Fraude],
+    'fraudes_comercios_no_seguros_features'[PERFIL_RIESGO] = "MUY_ALTO"
+)
+-- Formato: #,##0.00
+```
+
+```dax
+-- Para colorear el donut Crédito vs Débito o nivel de tarjeta
+-- Verde = Débito (menor ticket promedio normalmente)
+-- Rojo = Crédito (mayor exposición)
+Color Tipo Tarjeta =
+SWITCH(
+    MAX('fraudes_comercios_no_seguros_features'[TIPO_TARJETA]),
+    "CREDITO", "#C00000",
+    "DEBITO",  "#1D6F42",
+    "#808080"
+)
+```
+
+```dax
+-- Color por nivel de tarjeta (mayor nivel = más exposición potencial)
+Color Nivel Tarjeta =
+SWITCH(
+    MAX('fraudes_comercios_no_seguros_features'[NIVEL_TARJETA]),
+    "BLACK",    "#1A1A1A",
+    "PLATINUM", "#A0A0A0",
+    "GOLD",     "#C9A84C",
+    "CLASSIC",  "#1D3557",
+    "#808080"
+)
+```
+
+---
+
+### Configuración tabla Top Tarjetas (Página 4)
+```
+Columnas:
+  TARJETA                       → número enmascarado
+  TIPO_TARJETA                  → Crédito / Débito
+  NIVEL_TARJETA                 → Classic / Gold / Platinum / Black
+  SEGMENTO                      → segmento del cliente
+  [# Fraudes]                   → total de fraudes de esa tarjeta
+  [Monto Fraude]                → monto total  (formato S/ #,##0)
+  [Comercios Distintos Tarjeta] → en cuántos comercios tuvo fraude
+  DIAS_ACTIVA_TRJ               → días distintos con fraude
+  PERFIL_RIESGO                 → BAJO/MEDIO/ALTO/MUY_ALTO
+  SCORE_RIESGO_TRJ              → valor numérico 0-6
+
+Ordenar por: [# Fraudes] DESC  o  [Monto Fraude] DESC
+Formato condicional en SCORE_RIESGO_TRJ:
+  0-1 → verde  |  2-3 → amarillo  |  4-6 → rojo
+
+Filtro de página recomendado:
+  TOTAL_FRAUDES_TARJETA > 1   (mostrar solo reincidentes)
+  o dejar sin filtro y que el usuario use el slicer PERFIL_RIESGO
 ```
 
 ---
