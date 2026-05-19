@@ -246,6 +246,219 @@ CALCULATE(
 
 ---
 
+## PÁGINA 3 — Comercios & MCC
+
+```dax
+-- KPI: nombre del comercio con más monto fraudulento
+Top Comercio =
+VAR resumen =
+    ADDCOLUMNS(
+        VALUES('fraudes_comercios_no_seguros_features'[COMERCIO_NOMBRE]),
+        "monto", CALCULATE([Monto Fraude])
+    )
+RETURN
+    MAXX(TOPN(1, resumen, [monto], DESC), [COMERCIO_NOMBRE])
+```
+
+```dax
+-- KPI: MCC con más monto fraudulento
+Top MCC =
+VAR resumen =
+    ADDCOLUMNS(
+        VALUES('fraudes_comercios_no_seguros_features'[MCC]),
+        "monto", CALCULATE([Monto Fraude])
+    )
+RETURN
+    MAXX(TOPN(1, resumen, [monto], DESC), [MCC])
+```
+
+```dax
+-- KPI: monto promedio de fraude por comercio
+Monto Promedio por Comercio =
+DIVIDE(
+    [Monto Fraude],
+    [Comercios Únicos]
+)
+-- Formato: #,##0.00
+```
+
+```dax
+-- % que representa el comercio/MCC seleccionado sobre el total general
+-- Usar en barras horizontales como etiqueta de participación
+% Participación sobre Total =
+DIVIDE(
+    [Monto Fraude],
+    CALCULATE(
+        [Monto Fraude],
+        ALL('fraudes_comercios_no_seguros_features')
+    )
+)
+-- Formato: 0.00%
+```
+
+```dax
+-- Concentración: % que acumulan los TOP N comercios
+-- Usar con parámetro numérico o fijo en 10/20
+% Top 10 Comercios =
+VAR top10 =
+    TOPN(
+        10,
+        VALUES('fraudes_comercios_no_seguros_features'[COMERCIO_ID]),
+        CALCULATE([Monto Fraude]),
+        DESC
+    )
+VAR monto_top10 =
+    CALCULATE(
+        [Monto Fraude],
+        KEEPFILTERS(top10)
+    )
+RETURN
+    DIVIDE(
+        monto_top10,
+        CALCULATE([Monto Fraude], ALL('fraudes_comercios_no_seguros_features'))
+    )
+-- Formato: 0.0%
+-- Interpretación: si sale 65% → los 10 comercios más golpeados
+--                 concentran el 65% del monto total defraudado
+```
+
+```dax
+-- Tarjetas distintas afectadas en el comercio seleccionado
+Tarjetas en Comercio =
+DISTINCTCOUNT('fraudes_comercios_no_seguros_features'[TARJETA])
+```
+
+```dax
+-- Días distintos con al menos un fraude en el comercio
+Días con Fraude =
+DISTINCTCOUNT('fraudes_comercios_no_seguros_features'[FECHA_DIA])
+```
+
+```dax
+-- Ticket mínimo del comercio
+Ticket Mínimo =
+MIN('fraudes_comercios_no_seguros_features'[IMPORTE])
+-- Formato: #,##0.00
+```
+
+```dax
+-- Ticket máximo del comercio
+Ticket Máximo =
+MAX('fraudes_comercios_no_seguros_features'[IMPORTE])
+-- Formato: #,##0.00
+```
+
+```dax
+-- % de transacciones del comercio que vienen de tarjetas en ráfaga
+-- (tarjeta con 3+ fraudes ese día en cualquier comercio)
+% Ráfaga en Comercio =
+DIVIDE(
+    CALCULATE(
+        COUNTROWS('fraudes_comercios_no_seguros_features'),
+        'fraudes_comercios_no_seguros_features'[FLAG_RAFAGA_DIA] = 1
+    ),
+    [# Fraudes]
+)
+-- Formato: 0.0%
+-- Interpretación: 40% → 4 de cada 10 fraudes en ese comercio
+--   vinieron de tarjetas que ese día cometieron 3+ fraudes en total
+--   Señal: comercio siendo usado en operaciones de fraude masivo
+```
+
+```dax
+-- % de fraudes del comercio con monto redondo (señal de card testing)
+% Monto Redondo en Comercio =
+DIVIDE(
+    CALCULATE(
+        COUNTROWS('fraudes_comercios_no_seguros_features'),
+        'fraudes_comercios_no_seguros_features'[FLAG_MONTO_REDONDO] = 1
+    ),
+    [# Fraudes]
+)
+-- Formato: 0.0%
+-- Interpretación: montos exactos (100.00, 50.00) son típicos de
+--   pruebas automatizadas de tarjetas clonadas
+```
+
+```dax
+-- Color condicional para barras del scatter o top comercios
+-- Verde si pocos fraudes, rojo si muchos (relativo al promedio)
+Color Comercio Riesgo =
+VAR promedio_fraudes =
+    AVERAGEX(
+        VALUES('fraudes_comercios_no_seguros_features'[COMERCIO_ID]),
+        CALCULATE([# Fraudes])
+    )
+VAR fraudes_actual = [# Fraudes]
+RETURN
+    IF(fraudes_actual > promedio_fraudes * 2, "#C00000",   -- rojo: muy por encima
+    IF(fraudes_actual > promedio_fraudes,     "#FF8C00",   -- naranja: sobre promedio
+                                             "#1D6F42"))   -- verde: bajo promedio
+-- Usar en: Formato del visual → Color de datos → fx → Valor de campo
+```
+
+```dax
+-- Para el scatter: tamaño de burbuja = tarjetas distintas por comercio
+-- (ya existe como columna TARJETAS_DISTINTAS_COM, pero como medida
+--  funciona mejor con filtros del visual)
+Tarjetas Distintas Comercio =
+CALCULATE(
+    DISTINCTCOUNT('fraudes_comercios_no_seguros_features'[TARJETA])
+)
+```
+
+```dax
+-- Índice de concentración por comercio:
+-- cuántas tarjetas distintas por cada fraude
+-- Valor bajo → pocas tarjetas hacen muchos fraudes (más sospechoso)
+Fraudes por Tarjeta en Comercio =
+DIVIDE(
+    [# Fraudes],
+    [Tarjetas Distintas Comercio]
+)
+-- Formato: 0.00
+-- Interpretación: 5.0 → en promedio cada tarjeta tiene 5 fraudes
+--   en ese comercio → señal de ataque concentrado
+```
+
+---
+
+### Configuración del Scatter (Comercios)
+```
+Visual   : Gráfico de dispersión
+Eje X    : [# Fraudes]
+Eje Y    : [Monto Fraude]
+Tamaño   : [Tarjetas Distintas Comercio]
+Leyenda  : MCC  (para colorear por rubro)
+Detalles : COMERCIO_NOMBRE  (para tooltip e identificación)
+Tooltips : [Ticket Promedio], [% Ráfaga en Comercio],
+           [% Monto Redondo en Comercio], [Días con Fraude]
+```
+
+### Configuración tabla detalle (Página 3)
+```
+Columnas:
+  COMERCIO_NOMBRE     → nombre del comercio
+  MCC                 → rubro
+  [# Fraudes]         → conteo
+  [Monto Fraude]      → suma  (formato S/ #,##0)
+  [Tarjetas en Comercio]
+  [Ticket Promedio]
+  [Ticket Mínimo]
+  [Ticket Máximo]
+  [% Participación sobre Total]
+  [Días con Fraude]
+  [% Ráfaga en Comercio]
+  [% Monto Redondo en Comercio]
+  [Fraudes por Tarjeta en Comercio]
+
+Ordenar por: Monto Fraude DESC
+Formato condicional en [# Fraudes]: escala blanco → rojo
+Formato condicional en [% Ráfaga]:  escala blanco → rojo
+```
+
+---
+
 ## PÁGINA 4 — Perfil de Tarjetas
 
 ```dax
