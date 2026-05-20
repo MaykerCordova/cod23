@@ -6,30 +6,31 @@
 
 COLS = {
     # ── Identificadores ──────────────────────────────────────────────────────
-    "tarjeta"          : "TARJETA",           # número de tarjeta (masked)
-    "bin"              : "BIN",               # BIN de la tarjeta
-    "comercio_id"      : "COMERCIO_ID",       # ID o código del comercio
-    "comercio_nom"     : "COMERCIO_NOMBRE",   # nombre del comercio (si no existe, pon igual que comercio_id)
+    "tarjeta"          : "ACF-TARJETA REGISTRO 750",              # débito; crédito usa ACF-Tarjeta SHA256
+    "bin"              : "ACF-BIN",
+    "comercio_id"      : "ACF-NOMBRE/LOCALIZACION COMERCIO",      # Monitor no tiene ID separado
+    "comercio_nom"     : "ACF-NOMBRE/LOCALIZACION COMERCIO",
 
     # ── Fechas ───────────────────────────────────────────────────────────────
-    "fecha_hora_trx"   : "POS1_FECHA_HORA_TRX",  # datetime combinado  formato YYYY-MM-DD HH:MM:SS  ej. 2025-07-02 17:18:49
-    "fecha_cierre"     : "FECHA_CIERRE",          # fecha de cierre del caso  formato YYYY-MM-DD  ej. 2025-08-10
+    "fecha_hora_trx"   : "FECHA_HORA",        # columna construida por consolidar.py (YYYYMMDD + HH:MM:SS)
+    "fecha_cierre"     : "FECHA_CIERRE",      # fecha de cierre del caso  formato YYYY-MM-DD
 
     # ── Montos ────────────────────────────────────────────────────────────────
-    "monto"            : "IMPORTE",           # monto en moneda local (numérico)
-    "monto_dolar"      : "IMPORTE_USD",       # monto en dólares (numérico)
+    "monto"            : "ACF-MONTO EN MONEDA LOCAL",   # monto en moneda local (numérico)
+    "monto_dolar"      : "ACF-MONTO DOLLAR",            # monto en dólares (numérico)
 
     # ── Tarjeta / cliente ─────────────────────────────────────────────────────
-    "tipo_tarjeta"     : "TIPO_TARJETA",      # CREDITO / DEBITO
-    "nivel_tarjeta"    : "NIVEL_TARJETA",     # ej. CLASSIC, GOLD, PLATINUM, BLACK
-    "saldo_disponible" : "SALDO_DISPONIBLE",  # saldo disponible al momento de la transacción
-    "segmento"         : "SEGMENTO",          # segmento del cliente
-    "organizacion"     : "ORGANIZACION",      # SVP = Scotiabank  |  CSF = Santander
+    "tipo_tarjeta"     : "ACF-TIPO PROD TC",  # tipo de producto (TC/TD)
+    "nivel_tarjeta"    : "NIVEL_TARJETA",     # no disponible en Monitor — dejar como está
+    "saldo_disponible" : "ACF-SALDO DISPONIBLE EN MONEDA TRX",
+    "segmento"         : "VAA-EVENTO DE COMPROMISO OTRA FUENTE",
+    "organizacion"     : "ACF-ORGANIZACION",  # SBP = Scotiabank  |  CSF = Santander
+    "marca"            : "",                  # franquicia: 4 = Visa  |  5 = Mastercard — configurar manualmente
 
     # ── Comercio / transacción ────────────────────────────────────────────────
-    "canal"            : "CANAL",             # canal de la transacción
-    "mcc"              : "MCC",               # Merchant Category Code
-    "cvv_dinamico"     : "CVV_DINAMICO",      # ¿CVV dinámico? (S/N o 1/0). Pon None si no tienes.
+    "canal"            : "ACF-CANAL",
+    "mcc"              : "ACF-MCC",           # débito usa "ACF-MCC +" (con espacio y +)
+    "cvv_dinamico"     : "ACF-COD RED COMERCIO",  # S=Estático TD  D=Dinámico TC/TD  E=Estático TC  N=Sin CVV
 
     # ── Fraude ────────────────────────────────────────────────────────────────
     "modalidad_fraude" : "MODALIDAD_FRAUDE",  # modalidad del fraude (ej. CNP, SKIMMING, PHISHING…)

@@ -1,13 +1,14 @@
 """
 consolidar_journals.py
 ──────────────────────
-Une los 8 journals de Monitor (enero–abril) en un solo DataFrame.
+Une los journals de Monitor (por quincena) en un solo DataFrame.
 
 Reglas de carga:
   · Header en fila 4  → skiprows=3
-  · Todo se lee como texto (dtype=str) excepto MONTO
-  · Se construye FECHA_HORA combinando FECHA_TRX + HORA_TRX
-  · Se agrega columna MES para trazabilidad
+  · Todo se lee como texto (dtype=str) excepto ACF-MONTO EN MONEDA LOCAL
+  · Se construye FECHA_HORA combinando ACF-FECHA TRX + ACF-HORA TRX
+  · Se agrega columna QUINCENA para trazabilidad
+  · Salida: parquet (no pickle)
 """
 
 import pandas as pd
@@ -29,10 +30,10 @@ ARCHIVOS = [
     ("journal_abril_q2.xlsx",    "Abr-Q2"),
 ]
 
-# Nombre exacto de las columnas en Monitor (ajustar si difieren)
-COL_MONTO = "MONTO"          # columna monto → se castea a float
-COL_FECHA = "FECHA_TRX"      # formato AAAAMMDD  (ej. 20250115)
-COL_HORA  = "HORA_TRX"       # formato HH:MM:SS  (ej. 14:32:07)
+# Columnas reales de Monitor
+COL_MONTO = "ACF-MONTO EN MONEDA LOCAL"   # se castea a float
+COL_FECHA = "ACF-FECHA TRX"              # formato AAAAMMDD  (ej. 20250115)
+COL_HORA  = "ACF-HORA TRX"              # formato HH:MM:SS  (ej. 14:32:07)
 
 SKIPROWS  = 3                # header en fila 4 → saltar las 3 primeras
 
@@ -167,9 +168,10 @@ def resumen(df: pd.DataFrame):
     print(f"\n  Distribución por quincena:")
     print(df["QUINCENA"].value_counts().sort_index().to_string(header=False))
 
-    if "INDICADOR" in df.columns:
+    col_ind = "ACF-INDICADOR DE FRAUDE"
+    if col_ind in df.columns:
         print(f"\n  Distribución por Indicador:")
-        print(df["INDICADOR"].value_counts().to_string(header=False))
+        print(df[col_ind].value_counts().to_string(header=False))
 
     if COL_MONTO in df.columns:
         print(f"\n  Monto (S/):")
@@ -195,10 +197,8 @@ if __name__ == "__main__":
     # Resumen
     resumen(df_total)
 
-    # Guardar consolidado (pickle para preservar dtypes, + Excel para revisión)
-    df_total.to_pickle("transferencias_consolidado.pkl")
-    df_total.to_excel("transferencias_consolidado.xlsx", index=False)
+    # Guardar consolidado como parquet
+    df_total.to_parquet("transferencias_consolidado.parquet", index=False)
 
-    print("\n✅ Archivos guardados:")
-    print("   · transferencias_consolidado.pkl   ← usa este en los análisis")
-    print("   · transferencias_consolidado.xlsx  ← para revisión visual")
+    print("\n✅ Archivo guardado:")
+    print("   · transferencias_consolidado.parquet  ← usa este en los análisis")
