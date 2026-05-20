@@ -3,13 +3,14 @@ Feature Engineering — Comercios No Seguros (sin 3DS/TDS)
 Dataset: fraudes confirmados ya filtrados (todo el parquet es fraude F).
 
 Bloques:
-  A  Parseo de fechas  → DATETIME_TRX, DATETIME_CIERRE
-  B  Variables temporales    → hora, día, franja, quincena
-  C  Días de investigación   → DIAS_PARA_CIERRE
-  D  Velocidad por tarjeta   → conteo/monto de fraudes de esa tarjeta
-  E  Perfil del comercio     → concentración de fraude por comercio/MCC
-  F  Señales de monto        → monto redondo, ratio vs saldo, rango
-  G  Flags compuestos        → score de riesgo, perfil para Power BI
+  A  Parseo de fechas       → DATETIME_TRX, DATETIME_CIERRE
+  B  Variables temporales   → hora, día, franja, quincena
+  C  Días de investigación  → DIAS_PARA_CIERRE
+  D  Velocidad por tarjeta  → conteo/monto de fraudes de esa tarjeta
+  D2 Ventanas temporales    → txn y monto acumulado en 2/5/10 min, 1h, 24h
+  E  Perfil del comercio    → concentración de fraude por comercio/MCC
+  F  Señales de monto       → monto redondo, ratio vs saldo, rango
+  G  Flags compuestos       → score de riesgo, perfil para Power BI
   H  Guardar parquet enriquecido
 """
 
@@ -82,6 +83,21 @@ ruta_entrada = sys.argv[1] if len(sys.argv) > 1 else PARQUET_INPUT
 print("─" * 65)
 print(f"Cargando: {ruta_entrada}")
 df = leer_archivo(ruta_entrada)
+
+# ── Validación de columnas configuradas ──────────────────────────────────────
+cols_reales = set(df.columns)
+cols_config = {k: v for k, v in C.items() if v}  # solo los que tienen valor
+faltantes = {k: v for k, v in cols_config.items() if v not in cols_reales}
+
+if faltantes:
+    print("\n⚠️  COLUMNAS NO ENCONTRADAS EN EL ARCHIVO:")
+    print("   (actualiza config.py con el nombre exacto de tu parquet)\n")
+    for clave, nombre_config in faltantes.items():
+        print(f"   config['{clave}'] = '{nombre_config}'  ← NO existe")
+    print("\n   Columnas disponibles en tu archivo:")
+    for c in sorted(df.columns):
+        print(f"     {c}")
+    print()
 
 # ── Conversión de tipos ───────────────────────────────────────────────────────
 # Montos → numérico (pueden venir como string con comas o espacios)
@@ -232,6 +248,75 @@ df = df.merge(fraudes_dia_trj, on=[C["tarjeta"], "FECHA_DIA"], how="left")
 df["FLAG_TARJETA_REINCIDENTE"] = (df["TOTAL_FRAUDES_TARJETA"] > 1).astype(int)
 df["FLAG_MULTI_COMERCIO_DIA"]  = (df["COMERCIOS_DISTINTOS_DIA"] > 1).astype(int)
 df["FLAG_RAFAGA_DIA"]          = (df["FRAUDES_TRJ_DIA"] >= 3).astype(int)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  BLOQUE D2 — Ventanas temporales deslizantes por tarjeta
+#  Para cada transacción calcula cuántas txn y cuánto monto acumuló
+#  esa tarjeta en los N minutos/horas ANTERIORES a ese momento.
+#  Nota: se trabaja sobre el dataset de fraudes — mide velocidad
+#        con la que esa tarjeta acumuló fraudes confirmados.
+# ═══════════════════════════════════════════════════════════════════════════════
+print("\n[D2] Ventanas temporales deslizantes...")
+
+# Ordenar por tarjeta y tiempo (indispensable para las ventanas)
+df = df.sort_values([C["tarjeta"], "DATETIME_TRX"]).reset_index(drop=True)
+
+# Timestamp en segundos para aritmética rápida
+df["_ts"] = df["DATETIME_TRX"].astype(np.int64) // 10**9
+
+VENTANAS = {
+    "TXN_CARD_2M" :  (  2 * 60,  "count"),   # txn en últimos  2 minutos
+    "TXN_CARD_5M" :  (  5 * 60,  "count"),   # txn en últimos  5 minutos
+    "TXN_CARD_10M":  ( 10 * 60,  "count"),   # txn en últimos 10 minutos
+    "TXN_CARD_1H" :  ( 60 * 60,  "count"),   # txn en última   1 hora
+    "TXN_CARD_24H":  ( 24*3600,  "count"),   # txn en últimas 24 horas
+    "AMT_CARD_1H" :  ( 60 * 60,  "sum"),     # monto acumulado última 1 hora
+    "AMT_CARD_24H":  ( 24*3600,  "sum"),     # monto acumulado últimas 24 horas
+}
+
+def calcular_ventana(grupo, segundos, modo, col_monto):
+    """Para cada fila del grupo cuenta txn o suma monto en [t-segundos, t)."""
+    ts  = grupo["_ts"].values
+    amt = grupo[col_monto].values if modo == "sum" else None
+    n   = len(ts)
+    res = np.zeros(n)
+    for i in range(n):
+        t_inicio = ts[i] - segundos
+        j = np.searchsorted(ts, t_inicio, side="left")
+        if modo == "count":
+            res[i] = i - j          # filas anteriores dentro de la ventana
+        else:
+            res[i] = amt[j:i].sum() # monto acumulado dentro de la ventana
+    return res
+
+resultados = {col: np.zeros(len(df)) for col in VENTANAS}
+
+for tarjeta, grupo in df.groupby(C["tarjeta"], sort=False):
+    idx = grupo.index
+    for col, (segundos, modo) in VENTANAS.items():
+        vals = calcular_ventana(grupo, segundos, modo, C["monto"])
+        for i, ix in enumerate(idx):
+            resultados[col][ix] = vals[i]
+
+for col, vals in resultados.items():
+    df[col] = vals
+    if col.startswith("AMT_"):
+        df[col] = df[col].round(2)
+    else:
+        df[col] = df[col].astype(int)
+
+df.drop(columns=["_ts"], inplace=True)
+
+# Flags de ventana
+df["FLAG_VEL_ALTA_1H"]  = (df["TXN_CARD_1H"]  >= 2).astype(int)  # 2+ fraudes en 1h
+df["FLAG_VEL_ALTA_10M"] = (df["TXN_CARD_10M"] >= 2).astype(int)  # 2+ fraudes en 10min
+df["FLAG_ACUM_ALTO_1H"] = (df["AMT_CARD_1H"]  >= df[C["monto"]] * 2).astype(int)
+
+print(f"  TXN_CARD_2M  media : {df['TXN_CARD_2M'].mean():.2f} txn previas en 2 min")
+print(f"  TXN_CARD_1H  media : {df['TXN_CARD_1H'].mean():.2f} txn previas en 1 hora")
+print(f"  AMT_CARD_24H media : {df['AMT_CARD_24H'].mean():,.2f}")
+print(f"  FLAG_VEL_ALTA_1H   : {df['FLAG_VEL_ALTA_1H'].sum():,} txn con 2+ fraudes previos en 1h")
+print("  Ventanas temporales OK ✅")
 
 # Ratio monto del fraude vs saldo disponible
 if C["saldo_disponible"] in df.columns:
