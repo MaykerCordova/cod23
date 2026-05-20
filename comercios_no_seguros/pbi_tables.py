@@ -20,6 +20,7 @@ Tablas generadas:
 
 import pandas as pd
 import numpy as np
+import sys
 import os
 import warnings
 
@@ -28,8 +29,32 @@ warnings.filterwarnings("ignore")
 from config import COLS, PARQUET_OUTPUT
 
 C = COLS
-PARQUET_INPUT = PARQUET_OUTPUT       # salida del feature_engineering.py
-OUTPUT_DIR    = "pbi_tables"         # carpeta donde se guardan los CSVs
+OUTPUT_DIR = "pbi_tables"
+
+def leer_archivo(ruta):
+    if not os.path.exists(ruta):
+        print(f"\n❌ ERROR: No se encontró '{ruta}'.")
+        print("   Primero corre feature_engineering.py para generar el archivo enriquecido.")
+        print("   O pasa la ruta como argumento: python pbi_tables.py mi_archivo.csv\n")
+        sys.exit(1)
+    ext = os.path.splitext(ruta)[1].lower()
+    try:
+        if ext in (".parquet", ".pq"):
+            return pd.read_parquet(ruta)
+        if ext in (".csv", ".txt"):
+            return pd.read_csv(ruta, encoding="utf-8", low_memory=False)
+        if ext in (".xlsx", ".xls"):
+            return pd.read_excel(ruta)
+        # último recurso
+        try:
+            return pd.read_parquet(ruta)
+        except Exception:
+            return pd.read_csv(ruta, encoding="utf-8", low_memory=False)
+    except Exception as e:
+        print(f"\n❌ No se pudo leer '{ruta}': {e}\n")
+        sys.exit(1)
+
+ruta_entrada = sys.argv[1] if len(sys.argv) > 1 else PARQUET_OUTPUT
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -42,8 +67,8 @@ def guardar(df_out, nombre):
 #  CARGA
 # ═══════════════════════════════════════════════════════════════════════════════
 print("─" * 60)
-print(f"Leyendo {PARQUET_INPUT}...")
-df = pd.read_parquet(PARQUET_INPUT)
+print(f"Leyendo {ruta_entrada}...")
+df = leer_archivo(ruta_entrada)
 df["DATETIME_TRX"] = pd.to_datetime(df["DATETIME_TRX"])
 print(f"  {len(df):,} filas  |  {df.shape[1]} columnas")
 print("\nGenerando tablas Power BI...\n")
